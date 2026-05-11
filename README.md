@@ -1,45 +1,24 @@
-<p align="center">
-  <img src="https://img.shields.io/badge/python-3.12+-blue.svg" alt="Python 3.12+">
-  <img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License MIT">
-  <img src="https://img.shields.io/badge/platform-Windows-lightgrey.svg" alt="Windows">
-  <img src="https://img.shields.io/badge/status-WIP-orange.svg" alt="Work in Progress">
-</p>
+# Silverwolf — 本地 AI Agent
 
-<p align="center">
-  <h3 align="center">🤖 Silverwolf — 本地 AI 智能管家</h3>
-  <p align="center">一个跑在 Windows 上的本地 AI Agent，能听懂你说话、操作文件、上网搜索、收发 QQ 消息，还会记住你的偏好。</p>
-</p>
+一个运行在 Windows 本地的 AI Agent 系统。基于 Ollama 部署本地大模型，支持文件操作、网页搜索、QQ 消息收发、语音交互等功能。
 
-> ⚠️ **这是一个个人自用的开发中项目**，并非面向公众发行的产品。代码仅代表当前开发进展，随时可能大改。全程vibe coding，项目本意用于breakdown探索学习agent内部结构与功能注册。
+> 个人自用项目，仍在开发中。代码仅代表当前进展，不保证稳定可用。
 
----
+## 功能
 
-## ✨ 它能做什么
+- 文件操作：读取、写入、搜索、复制、移动、删除、批量处理
+- 网页搜索：浏览器搜索、网页抓取、内容提取
+- QQ 集成：通过 OneBot 协议收发消息、查询聊天记录
+- 文档处理：Word/Excel/PPT 的读取与编辑
+- 图片处理：图片描述、OCR 文字识别
+- 系统工具：时间查询、定时提醒、定时任务
+- 语音交互：唤醒词检测、Whisper ASR 语音转文字、GPT-SoVITS TTS 语音播报
+- 记忆系统：用户偏好与经验教训的持久化存储与自动召回
 
-- 📁 **管理文件** — "帮我把桌面上这周的周报整理一下，写个摘要" → 自动定位文件、读内容、写摘要（80%+稳定）
-- 🌐 **上网搜索** — "查一下 OpenAI 今天发布了什么" → 打开浏览器搜索、抓取网页、整理结果（容易被反爬ban）
-- 💬 **QQ 消息** — "看看 QQ 上谁找过我" → 查聊天记录、总结消息要点（开发中，已支持私聊与群聊+多条消息打包回复，并非一句一回）
-- ⏰ **定时提醒** — "半小时后提醒我开会" → 到点推送（80%+稳定）
-- 🎤 **语音交互** — 喊"嗨银狼"唤醒，直接说话下指令，TTS 语音回复（开发中）
-- 🧠 **记住偏好** — "以后搜索默认用 Bing" → 记住了，下次照办（80%+稳定）
-- 📄 **文档处理** — 读写 Word/Excel/PPT，编辑、总结、格式转换（80%+稳定）
-
-## 🧱 核心理念
-
-贯穿整个项目的边界：
+## 架构
 
 ```
-LLM（大模型）   →  只管 理解、规划、说人话
-工具模块       →  只管 校验参数、干活、返回结果
-Kernel（内核） →  只管 调度、验证、存证
-```
-
-**LLM 会犯错，代码不会。** 所以每个决策都要过代码层的验证链——参数不对就拦截，路径不存在就驳回，任务没做完就不许说"做好了"。这套设计让本地小模型也能稳定运行。
-
-## 🏗️ 架构
-
-```
-用户输入（文字 / QQ / 语音唤醒）
+用户输入（CLI / QQ / 语音）
         │
    ┌────▼────────────────────────────┐
    │         Agent Kernel            │
@@ -48,49 +27,65 @@ Kernel（内核） →  只管 调度、验证、存证
    │           │                     │
    │    ┌──────▼───────┐             │
    │    │   验证链       │             │
-   │    │ Validator    │   ← 参数校验  │
-   │    │ Critic       │   ← 决策审查  │
-   │    │ ExecCritic   │   ← 完成检查  │
+   │    │ Validator    │  参数校验     │
+   │    │ Critic       │  决策审查     │
+   │    │ ExecCritic   │  完成检查     │
    │    └──────┬───────┘             │
    │           │                     │
    │    ┌──────▼───────┐             │
-   │    │ 70+ 工具      │             │
-   │    │ 文件·网页·QQ  │             │
-   │    │ 文档·图片·系统 │             │
+   │    │ 工具模块       │             │
+   │    │ 文件·网页·QQ   │             │
+   │    │ 文档·图片·系统  │             │
    │    └──────────────┘             │
    └─────────────────────────────────┘
         │
    ┌────▼────────────────────────────┐
    │  Memory 三层记忆  │  Trace 全链路 │
-   │  SQLite 持久化    │  JSONL 审计   │
+   │  SQLite 持久化    │  JSONL 记录   │
    └─────────────────────────────────┘
 ```
 
-## 🚀 快速开始
+**核心设计**：LLM 负责理解意图和规划，工具模块负责参数校验和确定性执行，Kernel 负责编排调度和状态管理。LLM 的每个决策都要过代码层的验证链——参数校验不通过则拦截，文件路径不存在则驳回，任务未完成则不允许声称完成。
 
-### 前置条件
+**意图分析**：用户输入先经过正则快速匹配（识别本地路径、QQ 关键词、网页搜索等信号），再经 LLM 并行分析 6 个维度（知识类型、文档需求、站点搜索、任务拆解、记忆候选、指令识别），最终合并为一份 TaskEnvelope——规定本次任务的目标、可用工具族、必须产出、执行约束。这份合同在整个 turn 执行期间生效，后续每一步都受其约束。
 
-- **Python** >= 3.12
-- **Ollama** — [下载安装](https://ollama.com)，然后拉一个模型：
+**多层验证链**：
+- `DecisionValidator`：对 70+ 工具各写了一个参数校验方法，同时检查路径安全性
+- `DecisionCritic`：调用 LLM 二次审查 Planner 的决策，检查建议的文件路径是否在已知路径集合中，工具调用过渡是否合法
+- `ExecutionCritic`：在任务声称完成前检查 required_outputs 是否真的全部产出
+- `CompletionJudge`：对比 TaskEnvelope 的 required_outputs 与已完成的 outputs，判定任务是否结束
+- `LoopController`：检测重复调用、连续失败，控制最大执行步数
 
-```bash
-ollama pull qwen2.5:1.5b
-```
+**记忆系统**：分三层——
+| 层级 | 存储 | 内容 | 召回方式 |
+|------|------|------|------|
+| Hot Context | 内存 | 当前对话摘要 | 直接拼入 prompt |
+| Warm Memory | SQLite | 用户偏好、纠错、经验教训 | 按输入做 CJK bigram 分词检索 |
+| Cold Archive | SQLite | 历史会话归档 | 仅在"之前""上次"等关键词触发时检索 |
 
-- **Windows** — 部分文件操作和桌面功能依赖 Windows 路径
+Warm Memory 的存储类型包括 `user_fact`（用户事实）、`preference`（偏好）、`correction`（纠错）、`failure_pattern`（失败教训）、`success_pattern`（成功模式）等。超过 80 条学习记忆时自动压缩为 `lesson_digest`。
+
+**Trace 系统**：每次 turn 以 JSONL 格式记录 20+ 种事件（user_input → intent_context → decision_raw → decision_review → tool_request → tool_result → completion_check → final_response）。每次执行后自动生成 Markdown 格式的 Trace Audit 报告，包括时间线、工作流节点状态、自动检测的 warnings。异常终止时 Self-Diagnosis 自动收集工具执行结果，构造诊断 prompt 分析根因。
+
+**工具系统**：所有工具统一在 `ToolRegistry` 中注册，每个工具通过 `ToolManifest` 定义名称、描述、参数 schema、产出类型、安全标记（destructive / requires_confirmation）、权限模式（ALLOW / ASK / DENY）。破坏性操作需确认或直接拦截。Skill 系统支持将多步操作打包为单个工具，扫描 `skills/` 目录自动发现和注册。
+
+**语音交互**：支持麦克风持续监听、唤醒词检测（"嗨银狼"）、Whisper ASR 语音转文字、VAD 语音活动检测、GPT-SoVITS TTS 语音合成。`LiveTurnState` 将多个连续语音片段合并为一次完整 turn 后再提交给 Kernel。
+
+## 快速开始
+
+### 环境要求
+
+- Python >= 3.12
+- [Ollama](https://ollama.com) 已安装并拉取模型
+- Windows 系统
 
 ### 安装
 
 ```powershell
-# 克隆
 git clone https://github.com/namefinding/sliverwolf.git
 cd sliverwolf
-
-# 创建虚拟环境
 python -m venv .venv
 .\.venv\Scripts\activate
-
-# 安装
 pip install -e .
 ```
 
@@ -100,134 +95,63 @@ pip install -e .
 Copy-Item config.example.yaml config.yaml
 ```
 
-打开 `config.yaml`，改两个关键配置：
+编辑 `config.yaml`：
 
 ```yaml
 agent:
-  model: "qwen2.5:1.5b"           # 你 Ollama 里的模型名
-  workspace_root: "C:/Users/你的用户名/Desktop/testing"  # Agent 的工作目录
+  model: "qwen2.5:1.5b"
+  workspace_root: "C:/Users/你的用户名/Desktop/testing"
 ```
 
 ### 启动
 
 ```powershell
-# CLI 命令行模式
 python -m local_agent.app.main --config config.yaml
-
-# 或者双击
-start_agent_server.bat
 ```
 
-然后就可以打字跟它对话了。
+### 可选：启用语音
 
-### 可选的：启用语音
-
-需要提前装好 [GPT-SoVITS](https://github.com/RVC-Boss/GPT-SoVITS)。
-
-```yaml
-voice:
-  enabled: true                    # 开启 TTS 语音播报
-  gptsovits_root: "C:/GPT-SoVITS" # 改成你的 GPT-SoVITS 路径
-
-voice_input:
-  enabled: true                    # 开启语音输入
-  wake_word_enabled: true          # 开启"嗨银狼"唤醒词
-```
+需提前安装 [GPT-SoVITS](https://github.com/RVC-Boss/GPT-SoVITS)，然后在 `config.yaml` 中设置 `voice.enabled: true` 和 `voice_input.enabled: true`。
 
 ### 可选：接入 QQ
 
-需要提前部署 [LLOneBot](https://github.com/LLOneBot/LLOneBot) 或其他 OneBot 实现。
+需提前部署 OneBot 实现（如 [LLOneBot](https://github.com/LLOneBot/LLOneBot)），然后在 `config.yaml` 中设置 `onebot.enabled: true` 和 WebSocket 地址，运行 `start_qq_bot_gateway.bat`。
 
-```yaml
-onebot:
-  enabled: true
-  ws_url: "ws://127.0.0.1:3001"   # OneBot 的 WebSocket 地址
-```
-
-然后启动 QQ Bot 网关：
-
-```powershell
-start_qq_bot_gateway.bat
-```
-
-## 📦 项目结构
+## 项目结构
 
 ```
 src/local_agent/
-├── kernel/              ← 核心引擎（编排循环、验证链、意图分析）
-├── intent/              ← 意图分析服务
-├── modules/             ← 70+ 工具（文件、网页、QQ、文档、图片、系统）
-│   ├── file/            ← 文件读写搜索复制移动删除
-│   ├── web/             ← 浏览器搜索与网页抓取
-│   ├── qq/              ← QQ 消息记录收发
-│   ├── retrieval/       ← 本地文件语义检索
-│   ├── document_agent/  ← Word/Excel/PPT 读写编辑
-│   ├── image/           ← 图片描述与 OCR
-│   ├── system_utility/  ← 时间查询、定时提醒、定时任务
-│   └── ...
-├── memory/              ← 三层记忆（Hot/Warm/Cold）
-├── storage/             ← SQLite 记忆 + JSONL Trace + 审计报告
-├── skills/              ← 可插拔的 Skill 扩展包
-├── voice/               ← Whisper ASR + GPT-SoVITS TTS + 唤醒词
-├── protocol/            ← 数据模型与执行合同协议
-├── llm/                 ← Ollama / DeepSeek 等 LLM 客户端
-├── eval/                ← Trace 回放评估
-├── runners/             ← Agent 入口调度
-├── app/                 ← CLI / QQ Bot / 常驻服务器
-└── workflows/           ← 预定义工作流
+├── kernel/              # 核心引擎（编排循环、验证链、意图分析）
+├── intent/              # 意图分析服务
+├── modules/             # 工具模块
+│   ├── file/            # 文件读写搜索复制移动删除
+│   ├── web/             # 浏览器搜索与网页抓取
+│   ├── qq/              # QQ 消息记录收发
+│   ├── retrieval/       # 本地文件语义检索
+│   ├── document_agent/  # Word/Excel/PPT 读写编辑
+│   ├── image/           # 图片描述与 OCR
+│   ├── system_utility/  # 时间查询、定时提醒、定时任务
+│   └── memory/          # 记忆写入与召回
+├── memory/              # 三层记忆（Hot/Warm/Cold）
+├── storage/             # SQLite 存储 + JSONL Trace + 审计报告
+├── skills/              # Skill 扩展包
+├── voice/               # ASR + TTS + 唤醒词
+├── protocol/            # 数据模型与执行合同协议
+├── llm/                 # LLM 客户端（Ollama / DeepSeek）
+├── eval/                # Trace 回放评估
+├── runners/             # Agent 入口调度
+├── app/                 # CLI / QQ Bot / 常驻服务器
+└── workflows/           # 预定义工作流
 ```
 
-<details>
-<summary>📊 项目规模</summary>
+## 已知局限
 
-| 指标 | 数值 |
-|------|------|
-| Python 源文件 | 135 |
-| 总代码行数 | ~44,000 |
-| 测试用例 | 38 |
-| 工具数量 | 70+ |
-| 第三方 Agent 框架依赖 | 0 |
+- 单用户单会话设计，不支持多用户并发
+- 缺少系统化的离线评估 Benchmark
+- LLM 调用失败后无断点恢复
+- 部分功能仅支持 Windows
+- 测试覆盖率不高
 
-</details>
+## License
 
-## 🔒 安全设计
-
-| 机制 | 做了什么 |
-|------|---------|
-| 工作区沙箱 | 文件操作默认限制在 `workspace_root` 内 |
-| 破坏性操作确认 | 删除文件、发 QQ 消息需要确认或代码拦截 |
-| 参数硬校验 | 路径不存在 → 直接拒绝，不传给执行层 |
-| LLM 幻觉拦截 | LLM 建议读一个不存在的文件 → Critic 驳回 |
-| 过早完成拦截 | 要求产出文件但还没写入 → ExecutionCritic 不让结束 |
-| 全链路 Trace | 每一步记录在 JSONL 里，出问题可以回溯 |
-
-## ⚠️ 项目状态
-
-这个项目**正在活跃开发中**，是个人自用的实验性项目，**不是**面向公众发行的稳定产品。
-
-- 代码随时可能重构，不保证向后兼容
-- 功能可能在某个 commit 突然坏掉，过几天又修好
-- 你看到的代码只代表当前开发进度，不代表最终形态
-- 欢迎 Issue 和 PR，但不承诺响应时间
-- **不建议**直接拿它跑生产环境
-
-如果你在看我的代码来了解 Agent 系统的设计思路——那欢迎。如果你想 clone 下来玩——也欢迎，遇到问题可以提 Issue，修不修随缘 😄
-
-## 📋 已知局限 & 待办
-
-- [ ] 多用户并发支持（目前单用户单会话）
-- [ ] 系统化的离线评估 Benchmark
-- [ ] LLM 调用失败后的断点恢复
-- [ ] DecisionCritic 工具跳转规则的自动生成
-- [ ] 跨平台支持（目前部分功能 Windows only）
-- [ ] 测试覆盖率偏低（目前 38 个用例，远不够）
-
-## 📄 License
-
-MIT © 2025 Jin Zhenghao
-
----
-
-<p align="center">
-  <sub>Built with ❤️ in Shanghai · 全部手写，不调包搭 Agent</sub>
-</p>
+MIT
