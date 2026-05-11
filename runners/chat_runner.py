@@ -11,7 +11,7 @@ class ChatTurnRunner:
     def run(self, context: RunnerContext) -> ChatTurnResult:
         session = context.session
         kernel = session.kernel
-        context.service.prepare_turn_context(session, context.text)
+        context.service.prepare_turn_context(session, context.text, capture_user_instruction=False)
         kernel.history.append(Message(role=Role.USER, content=context.text))
         try:
             response = kernel.llm_client.chat_reply(

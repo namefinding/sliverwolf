@@ -136,7 +136,7 @@ class FileQueryNormalizer:
         ".xlsx": ("xls", "xlsx", "excel", "表格", "工作簿", "spreadsheet"),
         ".md": ("md", "markdown"),
         ".txt": ("txt", "文本"),
-        ".log": (".log", "log file", "日志文件", "日志格式"),
+        ".log": (".log", "log file"),
         ".pdf": (".pdf", "pdf"),
     }
 
@@ -154,7 +154,6 @@ class FileQueryNormalizer:
         "组会汇报",
         "开发日志",
         "开发记录",
-        "训练日志",
         "项目架构",
         "架构",
         "项目",
@@ -173,12 +172,7 @@ class FileQueryNormalizer:
         "相机",
     )
 
-    _ALIAS_MAP = {
-        "年会总结": ("年终汇报", "年终总结"),
-        "年终组会汇报": ("组会汇报", "年终汇报"),
-        "组会年终汇报": ("组会汇报", "年终汇报"),
-        "开发日志": ("开发记录", "训练日志"),
-    }
+    _ALIAS_MAP: dict[str, tuple[str, ...]] = {}
 
     @classmethod
     def normalize(cls, text: str) -> NormalizedFileQuery:

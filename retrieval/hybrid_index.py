@@ -33,6 +33,10 @@ TEXT_EXTENSIONS = {
     ".js",
     ".ts",
     ".tsx",
+    ".docx",
+    ".xlsx",
+    ".pptx",
+    ".log",
     ".jsx",
     ".css",
 }
@@ -527,9 +531,11 @@ class HybridIndexService:
         workspace_root: str,
         embedding_provider: EmbeddingProvider | None = None,
         reranker_provider: RerankerProvider | None = None,
+        extra_index_roots: list[str] | None = None,
     ) -> None:
         self.db_path = Path(db_path)
         self.workspace_root = Path(workspace_root).resolve()
+        self.extra_index_roots: list[Path] = [Path(p).resolve() for p in (extra_index_roots or []) if Path(p).is_dir()]
         self.path_normalizer = WorkspacePathNormalizer(str(self.workspace_root))
         self.embedding_provider = embedding_provider or HashEmbeddingProvider()
         self.reranker_provider = reranker_provider or HeuristicRerankerProvider()
@@ -544,8 +550,10 @@ class HybridIndexService:
         return conn
 
     def rebuild_filesystem_index(self) -> dict[str, int | str]:
-        provider = FileSystemIndexProvider(str(self.workspace_root), ignored_paths={self.db_path})
-        records = list(provider.iter_records())
+        records: list = []
+        for root_path in [self.workspace_root] + self.extra_index_roots:
+            provider = FileSystemIndexProvider(str(root_path), ignored_paths={self.db_path})
+            records.extend(provider.iter_records())
         with self._connect() as conn:
             conn.execute("DELETE FROM retrieval_objects")
             conn.execute("DELETE FROM retrieval_objects_fts")
@@ -628,8 +636,10 @@ class HybridIndexService:
         }
 
     def sync_filesystem_index(self) -> dict[str, int | str]:
-        provider = FileSystemIndexProvider(str(self.workspace_root), ignored_paths={self.db_path})
-        current_records = {record.path: record for record in provider.iter_records()}
+        current_records: dict[str, object] = {}
+        for root_path in [self.workspace_root] + self.extra_index_roots:
+            provider = FileSystemIndexProvider(str(root_path), ignored_paths={self.db_path})
+            current_records.update({record.path: record for record in provider.iter_records()})
 
         with self._connect() as conn:
             conn.row_factory = sqlite3.Row
@@ -1158,10 +1168,6 @@ class HybridIndexService:
 
     def _resolve_workspace_path(self, raw_path: str) -> Path:
         target = self.path_normalizer.resolve(raw_path)
-        try:
-            target.relative_to(self.workspace_root)
-        except ValueError as exc:
-            raise PermissionError(f"Path is outside workspace: {target}") from exc
         return target
 
     def _init_db(self) -> None:

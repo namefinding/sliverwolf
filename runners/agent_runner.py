@@ -14,6 +14,13 @@ class AgentTurnRunner:
         })
 
         context.service.prepare_turn_context(context.session, context.text)
+        memory_update_ack = context.service.try_memory_update_ack(context.session, context.text)
+        if memory_update_ack is not None:
+            print("[agent_runner:memory_update_ack]", {
+                "session_id": context.session.session_id,
+                "response_preview": (memory_update_ack.response or "")[:80],
+            })
+            return memory_update_ack
         fast_local_result = context.service.try_fast_local_answer(context.session, context.text)
         if fast_local_result is not None:
             print("[agent_runner:fast_local_answer]", {
