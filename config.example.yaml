@@ -1,0 +1,113 @@
+agent:
+  model: "qwen2.5:1.5b"
+  chat_model: "qwen2.5:1.5b"
+  critic_model: "qwen2.5:1.5b"
+  response_model: "qwen2.5:1.5b"
+  persona_name: "Local Butler"
+  persona_profile: "Calm, capable, concise, and slightly playful when appropriate."
+  chat_style_prompt: "Keep the reply natural, warm, and clear. Cover the main point and the most relevant context so the chat box feels informative, but avoid rambling or repetition."
+  display_style_prompt: "For screen display, give a fuller answer that covers the main result, key supporting details, and the practical takeaway. Keep enough information density to be useful, but do not become verbose."
+  speech_style_prompt: "For speech, stay shorter, more conversational, and avoid repeating the whole display text. Focus on the conclusion or next step."
+  tool_speech_enabled: true
+  speech_max_chars: 72
+  live_turn_quiet_window_ms: 20000
+  live_turn_incomplete_extra_ms: 350
+  live_turn_attachment_extra_ms: 350
+  live_turn_max_wait_ms: 30000
+  live_turn_fragment_max_wait_ms: 40000
+  live_turn_use_llm_judge: true
+  live_turn_typing_hold_ms: 1800
+  retrieval_embedding_enabled: true
+  retrieval_embedding_provider: "hash"
+  retrieval_embedding_model:
+  retrieval_embedding_dimensions: 128
+  retrieval_embedding_timeout_seconds: 30
+  retrieval_embedding_batch_size: 64
+  retrieval_reranker_provider: "heuristic"
+  retrieval_reranker_model:
+  retrieval_reranker_timeout_seconds: 30
+  retrieval_reranker_top_n: 5
+  ollama_base_url: "http://127.0.0.1:11434"
+  system_name: "Local Butler"
+  workspace_root: "C:/Users/namef/Desktop/testing"
+  memory_db_path: "data/agent_memory.sqlite3"
+  retrieval_db_path: "data/local_retrieval.sqlite3"
+  trace_path: "data/traces.jsonl"
+  max_steps: 6
+  request_timeout_seconds: 120
+
+voice:
+  enabled: false
+  async_playback: true
+  endpoint: "http://127.0.0.1:9880"
+  gptsovits_root: "C:/GPT-SoVITS"
+  api_host: "127.0.0.1"
+  api_port: 9880
+  api_script: "api_v2.py"
+  runtime_python: "runtime/python.exe"
+  gpt_weights_path: "C:/GPT-SoVITS/models/silverwolf/silverwolf_gpt.ckpt"
+  sovits_weights_path: "C:/GPT-SoVITS/models/silverwolf/silverwolf_sovits.pth"
+  ref_audio_path: "C:/GPT-SoVITS/models/silverwolf/该做的事都做完了么？好，别睡下了才想起来日常没做，拜拜。.wav"
+  prompt_text: ""
+  prompt_lang: "zh"
+  text_lang: "zh"
+  output_dir: "C:/GPT-SoVITS/output"
+  auto_start_server: true
+  shutdown_when_idle: true
+  play_audio: true
+  cleanup_audio: true
+  extra_payload: {}
+
+voice_input:
+  enabled: true
+  process_onebot_voice: true
+  wake_word_enabled: false
+  wake_words: ["嗨银狼"]
+  vad_enabled: false
+  temp_dir: "data/audio_inputs"
+  cleanup_temp: true
+  local_file_wait_seconds: 3.0
+  local_file_probe_interval_ms: 200
+
+asr:
+  enabled: false
+  provider: "faster_whisper"
+  model: "small"
+  model_download_root: "data/models/faster-whisper"
+  device: "cpu"
+  compute_type: "int8"
+  beam_size: 3
+  vad_filter: true
+  command: []
+  endpoint:
+  language: "zh"
+  request_timeout_seconds: 120
+  output_encoding: "utf-8"
+
+web:
+  search_provider: "browser"
+  browser_channel: "msedge"
+  browser_headless: false
+  browser_search_engine: "bing"
+  browser_launch_timeout_seconds: 30
+  fetch_allow_insecure: false
+  prefer_browser_fetch: false
+
+onebot:
+  enabled: false
+  ws_url: "ws://127.0.0.1:3001"
+  access_token:
+  send_replies: true
+  reconnect_delay_seconds: 5
+  coalesce_window_ms: 900
+  coalesce_short_message_extra_ms: 450
+  coalesce_attachment_extra_ms: 500
+  reply_delay_ms: 250
+  reply_segment_max_chars: 110
+  reply_segment_max_count: 3
+  reply_segment_delay_ms: 650
+  progress_update_enabled: false
+  progress_first_delay_ms: 2400
+  progress_min_interval_ms: 2200
+  progress_max_updates: 2
+  full_access_user_ids: []
