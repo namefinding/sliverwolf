@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse
 
@@ -10,6 +11,23 @@ from local_agent.modules.web.providers import ContentExtractor, PageFetcher, Sea
 
 
 class DefaultWebResearchPipeline:
+    HIGH_RISK_FETCH_DOMAINS = (
+        "zhihu.com",
+        "zhuanlan.zhihu.com",
+        "baike.baidu.com",
+    )
+    ANTI_BOT_MARKERS = (
+        "blocked_page",
+        "40362",
+        "access denied",
+        "captcha",
+        "verify you are human",
+        "unusual traffic",
+        "访问行为异常",
+        "请求存在异常",
+        "暂时限制",
+    )
+
     def __init__(
         self,
         *,
@@ -65,6 +83,21 @@ class DefaultWebResearchPipeline:
         allow_insecure: bool = False,
         prefer_browser: bool = False,
     ) -> dict:
+        if self._is_high_risk_url(url):
+            domain = urlparse(url).netloc
+            return {
+                "url": url,
+                "final_url": url,
+                "status_code": None,
+                "content_type": "",
+                "title": "",
+                "content": "",
+                "excerpt": "",
+                "extractor": "none",
+                "fetched_via": "skipped_high_risk_domain",
+                "truncated": False,
+                "warnings": [f"fetch_skipped_high_risk_domain:{domain}"],
+            }
         cache_key = f"fetch::{url}::{max_chars}::{prefer_browser}::{allow_insecure}"
         cached = self.cache.get(cache_key)
         if cached is not None:
@@ -73,6 +106,7 @@ class DefaultWebResearchPipeline:
         fetcher = self.browser_fetcher if prefer_browser and self.browser_fetcher is not None else self.http_fetcher
         page = fetcher.fetch(url, max_chars=max_chars, allow_insecure=allow_insecure)
         extracted = self._extract(page, max_chars=max_chars)
+        self._raise_for_invalid_page(page, extracted.content or page.html)
         payload = {
             "url": url,
             "final_url": page.final_url,
@@ -143,7 +177,7 @@ class DefaultWebResearchPipeline:
             warnings.append(f"search_failed: {exc}")
             results = []
 
-        unique_results = self._dedupe_results(results)
+        unique_results = self._prioritize_fetchable_results(self._dedupe_results(results))
         sources: list[ResearchSource] = []
         capped_results = unique_results[:max_pages]
         if capped_results:
@@ -167,7 +201,13 @@ class DefaultWebResearchPipeline:
                     try:
                         ordered_sources[index] = future.result()
                     except Exception as exc:
-                        ordered_warnings[index] = f"fetch_failed:{result.url}:{exc}"
+                        warning = f"fetch_failed:{result.url}:{exc}"
+                        ordered_warnings[index] = warning
+                        if self._is_anti_bot_error(exc):
+                            ordered_sources[index] = self._build_snippet_source(
+                                result,
+                                warnings=["fetch_skipped_or_blocked_by_anti_bot", warning],
+                            )
                 sources = [ordered_sources[index] for index in sorted(ordered_sources)]
                 warnings.extend(ordered_warnings[index] for index in sorted(ordered_warnings))
 
@@ -190,6 +230,8 @@ class DefaultWebResearchPipeline:
         allow_insecure: bool,
         prefer_browser: bool,
     ) -> ResearchSource:
+        if self._is_high_risk_fetch_result(result):
+            return self._build_snippet_source(result, warnings=["fetch_skipped_high_risk_domain"])
         fetched = self._fetch_research_page(
             url=result.url,
             max_chars=max_chars,
@@ -209,6 +251,24 @@ class DefaultWebResearchPipeline:
             published_at=result.published_at,
             status_code=int(fetched.get("status_code", 0)),
             warnings=[str(item) for item in fetched.get("warnings", []) if item],
+        )
+
+    @staticmethod
+    def _build_snippet_source(result: SearchResultRecord, *, warnings: list[str] | None = None) -> ResearchSource:
+        snippet = str(result.snippet or "").strip()
+        return ResearchSource(
+            title=result.title,
+            url=result.url,
+            source_domain=result.source_domain,
+            snippet=snippet,
+            content=snippet,
+            excerpt=snippet[:280],
+            provider=result.provider,
+            extractor="search_snippet",
+            fetched_via="search_result",
+            published_at=result.published_at,
+            status_code=None,
+            warnings=warnings or [],
         )
 
     def _fetch_research_page(
@@ -250,6 +310,67 @@ class DefaultWebResearchPipeline:
             if f"extractor_fallback:{primary_exc}" not in extracted.warnings:
                 extracted.warnings.append(f"extractor_fallback:{primary_exc}")
             return extracted
+
+    @staticmethod
+    def _raise_for_invalid_page(page, content: str) -> None:
+        text = str(content or "").strip()
+        lowered = text.lower()
+        if not text:
+            raise ValueError("empty_page_content")
+
+        if "c837c3673f657290e6fa7f9625d58826" in text or '"code":40362' in lowered:
+            raise ValueError("blocked_page: zhihu_40362")
+
+        if lowered.startswith("{") and lowered.endswith("}"):
+            try:
+                payload = json.loads(text)
+            except json.JSONDecodeError:
+                payload = None
+            if isinstance(payload, dict):
+                code = payload.get("code")
+                message = payload.get("message")
+                if code is not None and message:
+                    raise ValueError(f"error_json_page: code={code} message={str(message)[:120]}")
+
+        blocked_markers = (
+            "当前请求存在异常",
+            "暂时限制本次访问",
+            "access denied",
+            "captcha",
+            "verify you are human",
+            "unusual traffic",
+        )
+        if any(marker in lowered or marker in text for marker in blocked_markers):
+            domain = urlparse(str(getattr(page, "final_url", "") or getattr(page, "url", ""))).netloc
+            raise ValueError(f"blocked_page: {domain or 'unknown_domain'}")
+
+    @classmethod
+    def _prioritize_fetchable_results(cls, results: list[SearchResultRecord]) -> list[SearchResultRecord]:
+        return sorted(
+            results,
+            key=lambda item: (
+                1 if cls._is_high_risk_fetch_result(item) else 0,
+                item.rank or 999,
+            ),
+        )
+
+    @classmethod
+    def _is_high_risk_fetch_result(cls, result: SearchResultRecord) -> bool:
+        domain = (result.source_domain or urlparse(result.url).netloc or "").lower()
+        return cls._is_high_risk_domain(domain)
+
+    @classmethod
+    def _is_high_risk_url(cls, url: str) -> bool:
+        return cls._is_high_risk_domain(urlparse(str(url or "")).netloc.lower())
+
+    @classmethod
+    def _is_high_risk_domain(cls, domain: str) -> bool:
+        return any(domain == risky or domain.endswith(f".{risky}") for risky in cls.HIGH_RISK_FETCH_DOMAINS)
+
+    @classmethod
+    def _is_anti_bot_error(cls, exc: Exception) -> bool:
+        text = str(exc).lower()
+        return any(marker.lower() in text for marker in cls.ANTI_BOT_MARKERS)
 
     @staticmethod
     def _dedupe_results(results: list[SearchResultRecord]) -> list[SearchResultRecord]:

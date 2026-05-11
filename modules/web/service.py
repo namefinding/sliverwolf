@@ -12,11 +12,11 @@ from local_agent.modules.web.fetch_browser import PlaywrightPageFetcher
 from local_agent.modules.web.fetch_http import RequestsPageFetcher
 from local_agent.modules.web.pipeline import DefaultWebResearchPipeline
 from local_agent.modules.web.search_browser import PlaywrightSearchProvider
-from local_agent.protocol.models import OutputKind, ToolManifest
+from local_agent.protocol.models import OutputKind, ToolExecutionContextFields, ToolManifest
 from local_agent.protocol.models import WebConfig
 
 
-class WebSearchInput(BaseModel):
+class WebSearchInput(ToolExecutionContextFields):
     query: str
     max_results: int = 5
     domains: list[str] = Field(default_factory=list)
@@ -25,18 +25,18 @@ class WebSearchInput(BaseModel):
     language: str | None = None
 
 
-class WebFetchInput(BaseModel):
+class WebFetchInput(ToolExecutionContextFields):
     url: str
     max_chars: int = 8_000
     allow_insecure: bool = False
     prefer_browser: bool = False
 
 
-class WebOpenPageInput(BaseModel):
+class WebOpenPageInput(ToolExecutionContextFields):
     url: str
 
 
-class WebResearchInput(BaseModel):
+class WebResearchInput(ToolExecutionContextFields):
     query: str
     max_results: int = 5
     max_pages: int = 3
@@ -83,6 +83,7 @@ class WebModule:
                 description="Open a public webpage in the local browser when the user explicitly wants to visit it.",
                 side_effect=True,
                 idempotent=False,
+                requires_confirmation=True,
                 produces=[OutputKind.PATH_OPENED],
                 input_schema=WebOpenPageInput.model_json_schema(),
                 output_schema={"type": "object", "properties": {"url": {"type": "string"}, "opened": {"type": "boolean"}}},

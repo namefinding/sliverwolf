@@ -29,15 +29,12 @@ class PlaywrightSearchProvider:
         def _run(page) -> list[SearchResultRecord]:
             timeout_ms = self.timeout_seconds * 1000
             page.set_default_timeout(timeout_ms)
-            page.goto(self._engine_home_url(), wait_until="domcontentloaded", timeout=timeout_ms)
-            self._submit_query(page, query.query)
-            if not self._wait_for_results(page):
-                page.goto(
-                    self._search_url(query.query),
-                    wait_until="domcontentloaded",
-                    timeout=timeout_ms,
-                )
-                self._wait_for_results(page)
+            page.goto(
+                self._search_url(query.query),
+                wait_until="domcontentloaded",
+                timeout=timeout_ms,
+            )
+            self._wait_for_results(page)
             return self._extract_results(page, provider=self.name)
 
         results = self.runtime.run_with_page(_run)
@@ -53,29 +50,14 @@ class PlaywrightSearchProvider:
             )
         return results[: query.max_results]
 
-    def _engine_home_url(self) -> str:
-        if self.search_engine == "google":
-            return "https://www.google.com/"
-        return "https://www.bing.com/"
-
-    def _submit_query(self, page, query_text: str) -> None:
-        if self.search_engine == "google":
-            locator = page.locator('textarea[name="q"], input[name="q"]').first
-        else:
-            locator = page.locator('textarea[name="q"], input[name="q"], #sb_form_q').first
-        locator.wait_for(timeout=self.timeout_seconds * 1000)
-        locator.fill(query_text)
-        locator.press("Enter")
-
     def _wait_for_results(self, page) -> bool:
         timeout_ms = self.timeout_seconds * 1000
-        selectors = ["div.g"] if self.search_engine == "google" else ["li.b_algo", "#b_results"]
-        for selector in selectors:
-            try:
-                page.locator(selector).first.wait_for(timeout=timeout_ms)
-                return True
-            except Exception:
-                continue
+        selector = "div.g" if self.search_engine == "google" else "li.b_algo, #b_results"
+        try:
+            page.locator(selector).first.wait_for(timeout=timeout_ms)
+            return True
+        except Exception:
+            pass
         return self._has_result_candidates(page)
 
     def _extract_results(self, page, *, provider: str) -> list[SearchResultRecord]:
@@ -135,9 +117,9 @@ class PlaywrightSearchProvider:
             link = item.locator("h2 a").first
             if link.count() == 0:
                 continue
-            title = (link.text_content() or "").strip()
+            title = PlaywrightSearchProvider._safe_text_content(link)
             url = PlaywrightSearchProvider._normalize_bing_target_url((link.get_attribute("href") or "").strip())
-            snippet = (item.locator("p").first.text_content() or "").strip()
+            snippet = PlaywrightSearchProvider._safe_child_text(item, "p")
             if not title or not url:
                 continue
             parsed = urlparse(url)
@@ -185,9 +167,9 @@ class PlaywrightSearchProvider:
             title_node = item.locator("h3").first
             if link.count() == 0 or title_node.count() == 0:
                 continue
-            title = (title_node.text_content() or "").strip()
+            title = PlaywrightSearchProvider._safe_text_content(title_node)
             url = (link.get_attribute("href") or "").strip()
-            snippet = (item.locator("div.VwiC3b, span.aCOpRe").first.text_content() or "").strip()
+            snippet = PlaywrightSearchProvider._safe_child_text(item, "div.VwiC3b, span.aCOpRe")
             if not title or not url.startswith("http"):
                 continue
             parsed = urlparse(url)
@@ -202,3 +184,25 @@ class PlaywrightSearchProvider:
                 )
             )
         return results
+
+    @staticmethod
+    def _safe_child_text(locator, selector: str) -> str:
+        try:
+            child = locator.locator(selector)
+            if child.count() == 0:
+                return ""
+            return PlaywrightSearchProvider._safe_text_content(child.first)
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _safe_text_content(locator) -> str:
+        try:
+            return (locator.text_content(timeout=1500) or "").strip()
+        except TypeError:
+            try:
+                return (locator.text_content() or "").strip()
+            except Exception:
+                return ""
+        except Exception:
+            return ""

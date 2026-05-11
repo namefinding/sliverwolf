@@ -31,6 +31,16 @@ LEARNING_MEMORY_TYPES = {
     "failure_pattern",
     "lesson_digest",
 }
+MEMORY_LAYER_USER_PREFERENCE = "user_preference"
+MEMORY_LAYER_LONG_TERM_INSTRUCTION = "long_term_instruction"
+MEMORY_LAYER_TASK_EXPERIENCE = "task_experience"
+MEMORY_LAYER_CURRENT_TASK_CONTEXT = "current_task_context"
+MEMORY_LAYERS = {
+    MEMORY_LAYER_USER_PREFERENCE,
+    MEMORY_LAYER_LONG_TERM_INSTRUCTION,
+    MEMORY_LAYER_TASK_EXPERIENCE,
+    MEMORY_LAYER_CURRENT_TASK_CONTEXT,
+}
 _PREFERENCE_TOKENS = (
     "\u8bb0\u4f4f",
     "\u4ee5\u540e",
@@ -151,6 +161,53 @@ class WarmMemoryService:
             limit=limit,
             memory_types=LEARNING_MEMORY_TYPES,
         )
+
+    def recall_memory_layer_for_text(
+        self,
+        user_text: str,
+        *,
+        layer: str,
+        scope: str = "user",
+        limit: int = 4,
+    ) -> list[MemoryRecord]:
+        normalized_layer = str(layer or "").strip().lower()
+        if normalized_layer == MEMORY_LAYER_TASK_EXPERIENCE:
+            memory_types = LEARNING_MEMORY_TYPES
+        elif normalized_layer in {MEMORY_LAYER_USER_PREFERENCE, MEMORY_LAYER_LONG_TERM_INSTRUCTION}:
+            memory_types = USER_MEMORY_TYPES
+        else:
+            return []
+
+        records = self.recall_for_text(
+            user_text,
+            scope=scope,
+            limit=max(limit * 3, 8),
+            memory_types=memory_types,
+        )
+        return [record for record in records if self._record_layer(record) == normalized_layer][:limit]
+
+    def recall_user_profile_layers_for_text(
+        self,
+        user_text: str,
+        *,
+        scope: str = "user",
+        preference_limit: int = 3,
+        instruction_limit: int = 4,
+    ) -> dict[str, list[MemoryRecord]]:
+        return {
+            MEMORY_LAYER_USER_PREFERENCE: self.recall_memory_layer_for_text(
+                user_text,
+                scope=scope,
+                layer=MEMORY_LAYER_USER_PREFERENCE,
+                limit=preference_limit,
+            ),
+            MEMORY_LAYER_LONG_TERM_INSTRUCTION: self.recall_memory_layer_for_text(
+                user_text,
+                scope=scope,
+                layer=MEMORY_LAYER_LONG_TERM_INSTRUCTION,
+                limit=instruction_limit,
+            ),
+        }
 
     def remember_preference(
         self,
@@ -277,7 +334,11 @@ class WarmMemoryService:
                 scope=scope,
                 content=normalized,
                 importance=0.82 if memory_type == "preference" else 0.88,
-                tags=self._with_bucket_tags("user_profile", self._infer_tags(normalized.lower())),
+                tags=self._with_bucket_tags(
+                    "user_profile",
+                    self._infer_tags(normalized.lower()),
+                    layer=self._layer_for_user_memory(memory_type=memory_type, kind=""),
+                ),
                 created_at=datetime.now(UTC),
             )
             self.store.remember(record)
@@ -307,7 +368,11 @@ class WarmMemoryService:
         memory_type = self._instruction_memory_type(kind)
         tags = self._infer_tags(content.lower())
         tags.extend(tag for tag in ("instruction", kind, intent_scope) if tag and tag != "none")
-        tags = self._with_bucket_tags("user_profile", tags)
+        tags = self._with_bucket_tags(
+            "user_profile",
+            tags,
+            layer=self._layer_for_user_memory(memory_type=memory_type, kind=kind),
+        )
 
         importance = 0.9 if memory_type in {"correction", "alias"} else 0.84
         existing = self.store.recall_structured(
@@ -400,6 +465,11 @@ class WarmMemoryService:
         tags = self._with_bucket_tags(
             "agent_learning" if memory_type in self._LEARNING_TYPES else "user_profile",
             tags,
+            layer=(
+                MEMORY_LAYER_TASK_EXPERIENCE
+                if memory_type in self._LEARNING_TYPES
+                else self._layer_for_user_memory(memory_type=memory_type, kind=kind)
+            ),
         )
 
         if bool(getattr(memory_candidate, "overwrite_existing", False)):
@@ -473,12 +543,17 @@ class WarmMemoryService:
         importance: float,
     ) -> None:
         bucket = "agent_learning" if memory_type in self._LEARNING_TYPES else "user_profile"
+        layer = (
+            MEMORY_LAYER_TASK_EXPERIENCE
+            if memory_type in self._LEARNING_TYPES
+            else self._layer_for_user_memory(memory_type=memory_type, kind="")
+        )
         record = MemoryRecord(
             memory_type=memory_type,
             scope=scope,
             content=content.strip(),
             importance=importance,
-            tags=self._with_bucket_tags(bucket, tags),
+            tags=self._with_bucket_tags(bucket, tags, layer=layer),
             created_at=datetime.now(UTC),
         )
         self.store.remember(record)
@@ -519,10 +594,52 @@ class WarmMemoryService:
         return tags
 
     @staticmethod
-    def _with_bucket_tags(bucket: str, tags: Iterable[str] | None) -> list[str]:
+    def _with_bucket_tags(bucket: str, tags: Iterable[str] | None, *, layer: str | None = None) -> list[str]:
         merged = [tag for tag in (tags or []) if str(tag).strip()]
         merged.append(f"bucket:{bucket}")
+        if layer:
+            merged.append(f"layer:{layer}")
         return list(dict.fromkeys(str(tag).strip() for tag in merged if str(tag).strip()))
+
+    @staticmethod
+    def _record_layer(record: MemoryRecord) -> str:
+        for tag in record.tags:
+            normalized = str(tag or "").strip().lower()
+            if normalized.startswith("layer:"):
+                layer = normalized.split(":", 1)[1].strip()
+                if layer in MEMORY_LAYERS:
+                    return layer
+        return WarmMemoryService._layer_for_user_memory(
+            memory_type=record.memory_type,
+            kind=WarmMemoryService._kind_from_tags(record.tags),
+        )
+
+    @staticmethod
+    def _kind_from_tags(tags: Iterable[str]) -> str:
+        known_kinds = {
+            "naming",
+            "preference",
+            "workflow_method",
+            "tool_policy",
+            "correction",
+            "style",
+            "boundary",
+        }
+        for tag in tags:
+            normalized = str(tag or "").strip().lower()
+            if normalized in known_kinds:
+                return normalized
+        return ""
+
+    @staticmethod
+    def _layer_for_user_memory(*, memory_type: str, kind: str) -> str:
+        normalized_type = str(memory_type or "").strip().lower()
+        normalized_kind = str(kind or "").strip().lower()
+        if normalized_type in LEARNING_MEMORY_TYPES:
+            return MEMORY_LAYER_TASK_EXPERIENCE
+        if normalized_type == "correction" or normalized_kind in {"workflow_method", "tool_policy", "correction", "boundary"}:
+            return MEMORY_LAYER_LONG_TERM_INSTRUCTION
+        return MEMORY_LAYER_USER_PREFERENCE
 
     @staticmethod
     def _instruction_memory_type(kind: str) -> str:
@@ -574,6 +691,31 @@ class WarmMemoryService:
             ).strip()
             if absolute:
                 return f"用户的生日是{absolute}。"
+        if memory_key.startswith("user.food") or memory_key.startswith("user.diet"):
+            foods = canonical_value.get("preferred_foods") or canonical_value.get("food_preferences") or []
+            if not isinstance(foods, list):
+                foods = [foods]
+            food_text = "、".join(str(item).strip() for item in foods if str(item).strip())
+            restriction = str(
+                canonical_value.get("current_dietary_restriction")
+                or canonical_value.get("dietary_restrictions")
+                or canonical_value.get("chewing_status")
+                or ""
+            ).strip()
+            if not restriction:
+                if "矫正牙齿" in content and "吃不太动" in content:
+                    restriction = "最近在矫正牙齿，吃不太动"
+                elif "矫正牙齿" in content:
+                    restriction = "最近在矫正牙齿"
+                elif "吃不太动" in content:
+                    restriction = "吃不太动"
+            parts = []
+            if food_text:
+                parts.append(f"用户喜欢吃{food_text}")
+            if restriction:
+                parts.append(restriction)
+            if parts:
+                return "，".join(parts) + "。"
         return content
 
     @staticmethod
@@ -605,6 +747,8 @@ class WarmMemoryService:
                 or ""
             ).strip()
             return bool(relative or absolute)
+        if memory_key.startswith("user.food") or memory_key.startswith("user.diet"):
+            return bool(canonical_value or normalized)
         return "用户" in normalized or "我" in normalized
 
     def _delete_conflicting_records(

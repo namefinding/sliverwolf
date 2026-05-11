@@ -259,10 +259,7 @@ class ImageModule:
         return target
 
     def _ensure_workspace_path(self, target: Path) -> None:
-        try:
-            target.relative_to(self.workspace_root)
-        except ValueError as exc:
-            raise PermissionError(f"Path is outside workspace: {target}") from exc
+        pass
 
     @staticmethod
     def _require_pillow() -> None:

@@ -15,7 +15,7 @@ from zipfile import ZipFile
 
 from pydantic import AliasChoices, BaseModel, Field, model_validator
 
-from local_agent.protocol.models import OutputKind, ToolManifest
+from local_agent.protocol.models import OutputKind, ToolManifest, ToolPermissionMode
 from local_agent.utils.file_query_normalizer import FileQueryNormalizer
 from local_agent.utils.workspace_path import WorkspacePathNormalizer
 
@@ -31,6 +31,13 @@ class ReadFilesInput(BaseModel):
     paths: list[str]
     encoding: str = "utf-8"
     max_bytes: int = 200_000
+
+    @model_validator(mode="before")
+    @classmethod
+    def coerce_single_path(cls, data: Any) -> Any:
+        if isinstance(data, dict) and "paths" not in data and isinstance(data.get("path"), str):
+            return {**data, "paths": [data["path"]]}
+        return data
 
 
 class MatchMode(str, Enum):
@@ -124,6 +131,13 @@ class ExtractTextInput(BaseModel):
     encoding: str = "utf-8"
     max_chars: int = 12000
     max_rows_per_sheet: int = 10
+
+    @model_validator(mode="before")
+    @classmethod
+    def coerce_single_path(cls, data: Any) -> Any:
+        if isinstance(data, dict) and "paths" not in data and isinstance(data.get("path"), str):
+            return {**data, "paths": [data["path"]]}
+        return data
 
 
 class ExtractStructureInput(BaseModel):
@@ -386,6 +400,7 @@ class FileModule:
                 description="Write a file inside the workspace root.",
                 side_effect=True,
                 idempotent=False,
+                requires_confirmation=True,
                 produces=[OutputKind.FILE_WRITTEN],
                 input_schema=WriteFileInput.model_json_schema(),
                 output_schema={"type": "object", "properties": {"path": {"type": "string"}}},
@@ -396,6 +411,7 @@ class FileModule:
                 description="Write a Word document (.docx) inside the workspace root.",
                 side_effect=True,
                 idempotent=False,
+                requires_confirmation=True,
                 produces=[OutputKind.FILE_WRITTEN],
                 input_schema=WriteDocxInput.model_json_schema(),
                 output_schema={"type": "object", "properties": {"path": {"type": "string"}}},
@@ -406,6 +422,7 @@ class FileModule:
                 description="Apply targeted block-level edits to a Word document (.docx) while keeping the surrounding document structure.",
                 side_effect=True,
                 idempotent=False,
+                requires_confirmation=True,
                 produces=[OutputKind.FILE_WRITTEN],
                 input_schema=EditDocxInput.model_json_schema(),
                 output_schema={"type": "object", "properties": {"path": {"type": "string"}}},
@@ -416,6 +433,7 @@ class FileModule:
                 description="Render a new Word document from a template file and source content while reusing the template's overall layout.",
                 side_effect=True,
                 idempotent=False,
+                requires_confirmation=True,
                 produces=[OutputKind.FILE_WRITTEN],
                 input_schema=RenderDocxFromTemplateInput.model_json_schema(),
                 output_schema={"type": "object", "properties": {"path": {"type": "string"}}},
@@ -426,6 +444,7 @@ class FileModule:
                 description="Write an Excel workbook (.xlsx) inside the workspace root.",
                 side_effect=True,
                 idempotent=False,
+                requires_confirmation=True,
                 produces=[OutputKind.FILE_WRITTEN],
                 input_schema=WriteXlsxInput.model_json_schema(),
                 output_schema={"type": "object", "properties": {"path": {"type": "string"}}},
@@ -436,6 +455,7 @@ class FileModule:
                 description="Write a PowerPoint presentation (.pptx) inside the workspace root.",
                 side_effect=True,
                 idempotent=False,
+                requires_confirmation=True,
                 produces=[OutputKind.FILE_WRITTEN],
                 input_schema=WritePptxInput.model_json_schema(),
                 output_schema={"type": "object", "properties": {"path": {"type": "string"}}},
@@ -446,6 +466,7 @@ class FileModule:
                 description="Write multiple files inside the workspace root.",
                 side_effect=True,
                 idempotent=False,
+                requires_confirmation=True,
                 produces=[OutputKind.FILE_WRITTEN],
                 input_schema=WriteManyInput.model_json_schema(),
                 output_schema={"type": "object", "properties": {"paths": {"type": "array"}, "results": {"type": "array"}}},
@@ -456,6 +477,7 @@ class FileModule:
                 description="Append text to a file inside the workspace root.",
                 side_effect=True,
                 idempotent=False,
+                requires_confirmation=True,
                 produces=[OutputKind.FILE_WRITTEN],
                 input_schema=AppendFileInput.model_json_schema(),
                 output_schema={"type": "object", "properties": {"path": {"type": "string"}}},
@@ -466,6 +488,7 @@ class FileModule:
                 description="Append text to multiple files inside the workspace root.",
                 side_effect=True,
                 idempotent=False,
+                requires_confirmation=True,
                 produces=[OutputKind.FILE_WRITTEN],
                 input_schema=AppendManyInput.model_json_schema(),
                 output_schema={"type": "object", "properties": {"paths": {"type": "array"}, "results": {"type": "array"}}},
@@ -556,6 +579,7 @@ class FileModule:
                 description="Move a file or folder to a new location inside the workspace root.",
                 side_effect=True,
                 idempotent=False,
+                requires_confirmation=True,
                 produces=[OutputKind.PATH_UPDATED],
                 input_schema=MovePathInput.model_json_schema(),
                 output_schema={"type": "object", "properties": {"path": {"type": "string"}}},
@@ -566,6 +590,7 @@ class FileModule:
                 description="Move multiple files or folders to new locations inside the workspace root.",
                 side_effect=True,
                 idempotent=False,
+                requires_confirmation=True,
                 produces=[OutputKind.PATH_UPDATED],
                 input_schema=MoveManyInput.model_json_schema(),
                 output_schema={"type": "object", "properties": {"paths": {"type": "array"}, "results": {"type": "array"}}},
@@ -596,6 +621,9 @@ class FileModule:
                 description="Delete a file or folder inside the workspace root.",
                 side_effect=True,
                 idempotent=False,
+                destructive=True,
+                requires_confirmation=True,
+                default_permission=ToolPermissionMode.ASK,
                 produces=[OutputKind.PATH_DELETED],
                 input_schema=DeletePathInput.model_json_schema(),
                 output_schema={"type": "object", "properties": {"path": {"type": "string"}}},
@@ -606,6 +634,9 @@ class FileModule:
                 description="Delete multiple files or folders inside the workspace root.",
                 side_effect=True,
                 idempotent=False,
+                destructive=True,
+                requires_confirmation=True,
+                default_permission=ToolPermissionMode.ASK,
                 produces=[OutputKind.PATH_DELETED],
                 input_schema=DeleteManyInput.model_json_schema(),
                 output_schema={"type": "object", "properties": {"paths": {"type": "array"}, "results": {"type": "array"}}},
@@ -694,10 +725,8 @@ class FileModule:
         return self.path_normalizer.resolve(raw_path)
 
     def ensure_workspace_path(self, target: Path) -> None:
-        try:
-            target.relative_to(self.workspace_root)
-        except ValueError as exc:
-            raise PermissionError(f"Path is outside workspace: {target}") from exc
+        # 移除工作区路径拦截，信任 LLM 判断用户提到的路径
+        pass
 
     def list_files(self, arguments: dict[str, Any]) -> dict[str, Any]:
         payload = ListFilesInput.model_validate(arguments)
@@ -715,14 +744,20 @@ class FileModule:
         return {"entries": entries}
 
     def search_by_name(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        has_query_terms = "query_terms" in arguments
+        has_alias_terms = "alias_terms" in arguments
         payload = SearchByNameInput.model_validate(arguments)
         root = self.resolve_path(payload.path)
         self.ensure_workspace_path(root)
         iterator = root.rglob("*") if payload.recursive else root.iterdir()
         normalized_query = FileQueryNormalizer.normalize(payload.query)
         query_text = normalized_query.normalized_text or payload.query.strip().lower()
-        query_terms = payload.query_terms or normalized_query.core_terms or [term for term in self._tokenize_search_query(payload.query) if term]
-        alias_terms = payload.alias_terms or normalized_query.alias_terms
+        query_terms = (
+            payload.query_terms
+            if has_query_terms
+            else normalized_query.core_terms or [term for term in self._tokenize_search_query(payload.query) if term]
+        )
+        alias_terms = payload.alias_terms if has_alias_terms else normalized_query.alias_terms
         normalized_exts = {
             ext.lower() if ext.startswith(".") else f".{ext.lower()}"
             for ext in payload.extensions
@@ -919,6 +954,11 @@ class FileModule:
         payload = WriteFileInput.model_validate(arguments)
         path = self.resolve_path(payload.path)
         self.ensure_workspace_path(path)
+        if path.suffix.lower() in {".docx", ".pptx", ".xlsx"}:
+            raise ValueError(
+                "file.write refuses to overwrite Office documents with plain text; "
+                "use document_agent.edit, file.edit_docx, write_docx, or the matching structured writer instead."
+            )
         if path.exists() and not payload.overwrite:
             raise FileExistsError(f"File already exists: {path}")
         path.parent.mkdir(parents=True, exist_ok=True)

@@ -180,6 +180,23 @@ class QQHistoryStore:
             conn.commit()
         return message_id
 
+    def has_platform_message(self, platform_message_id: str | int | None) -> bool:
+        normalized_id = self._normalize_optional(platform_message_id)
+        if not normalized_id:
+            return False
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT id
+                FROM qq_history_messages
+                WHERE json_extract(metadata_json, '$.platform_message_id') = ?
+                   OR json_extract(metadata_json, '$.message_id') = ?
+                LIMIT 1
+                """,
+                (normalized_id, normalized_id),
+            ).fetchone()
+        return row is not None
+
     def get_last_reply(
         self,
         *,

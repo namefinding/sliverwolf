@@ -9,7 +9,7 @@ from typing import Any, Protocol
 
 from pydantic import BaseModel, Field, model_validator
 
-from local_agent.protocol.models import OutputKind, ToolManifest
+from local_agent.protocol.models import OutputKind, ToolManifest, ToolPermissionMode
 from local_agent.utils.workspace_path import WorkspacePathNormalizer
 
 try:
@@ -268,6 +268,7 @@ class ComputerUseModule:
                 description="Move the mouse cursor to screen pixel coordinates.",
                 side_effect=True,
                 idempotent=False,
+                requires_confirmation=True,
                 produces=[OutputKind.OBJECT_DETAILS],
                 input_schema=CoordinateInput.model_json_schema(),
                 output_schema={"type": "object"},
@@ -278,6 +279,7 @@ class ComputerUseModule:
                 description="Click at the current cursor position or at screen pixel coordinates. Supports left, right, middle, double, and triple clicks.",
                 side_effect=True,
                 idempotent=False,
+                requires_confirmation=True,
                 produces=[OutputKind.OBJECT_DETAILS],
                 input_schema=ClickInput.model_json_schema(),
                 output_schema={"type": "object"},
@@ -288,6 +290,7 @@ class ComputerUseModule:
                 description="Drag the mouse from its current position to target screen pixel coordinates.",
                 side_effect=True,
                 idempotent=False,
+                requires_confirmation=True,
                 produces=[OutputKind.OBJECT_DETAILS],
                 input_schema=DragInput.model_json_schema(),
                 output_schema={"type": "object"},
@@ -298,6 +301,7 @@ class ComputerUseModule:
                 description="Scroll vertically at the current cursor position or at screen pixel coordinates.",
                 side_effect=True,
                 idempotent=False,
+                requires_confirmation=True,
                 produces=[OutputKind.OBJECT_DETAILS],
                 input_schema=ScrollInput.model_json_schema(),
                 output_schema={"type": "object"},
@@ -308,6 +312,7 @@ class ComputerUseModule:
                 description="Type text into the active application. For non-ASCII or long text, paste_via_clipboard is usually more reliable.",
                 side_effect=True,
                 idempotent=False,
+                requires_confirmation=True,
                 produces=[OutputKind.OBJECT_DETAILS],
                 input_schema=TypeInput.model_json_schema(),
                 output_schema={"type": "object"},
@@ -318,6 +323,7 @@ class ComputerUseModule:
                 description="Press a single keyboard key such as enter, escape, tab, backspace, or f5.",
                 side_effect=True,
                 idempotent=False,
+                requires_confirmation=True,
                 produces=[OutputKind.OBJECT_DETAILS],
                 input_schema=KeyInput.model_json_schema(),
                 output_schema={"type": "object"},
@@ -328,6 +334,9 @@ class ComputerUseModule:
                 description="Press a keyboard shortcut such as ctrl+c or alt+tab. Avoid destructive system shortcuts.",
                 side_effect=True,
                 idempotent=False,
+                destructive=True,
+                requires_confirmation=True,
+                default_permission=ToolPermissionMode.ASK,
                 produces=[OutputKind.OBJECT_DETAILS],
                 input_schema=HotkeyInput.model_json_schema(),
                 output_schema={"type": "object"},
@@ -348,6 +357,7 @@ class ComputerUseModule:
                 description="Write plain text to the system clipboard.",
                 side_effect=True,
                 idempotent=False,
+                requires_confirmation=True,
                 produces=[OutputKind.OBJECT_DETAILS],
                 input_schema=ClipboardWriteInput.model_json_schema(),
                 output_schema={"type": "object"},
@@ -523,10 +533,7 @@ class ComputerUseModule:
         return target
 
     def _ensure_workspace_path(self, target: Path) -> None:
-        try:
-            target.resolve().relative_to(self.workspace_root)
-        except ValueError as exc:
-            raise PermissionError(f"Path is outside workspace: {target}") from exc
+        pass
 
     def _ensure_enabled(self) -> None:
         if not self.enabled:

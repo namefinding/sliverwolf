@@ -5,10 +5,15 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from local_agent.protocol.models import ToolManifest
+from typing import TYPE_CHECKING
+
+from local_agent.protocol.models import OutputKind, ToolManifest
 
 from .reminder_store import ReminderStore
 from .timezone_utils import resolve_timezone
+
+if TYPE_CHECKING:
+    from local_agent.protocol.models import ToolUseContext
 
 
 class GetTimeInput(BaseModel):
@@ -61,7 +66,7 @@ class SystemUtilityModule:
                 description="Get the current local time, date, or weekday.",
                 side_effect=False,
                 idempotent=True,
-                produces=[],
+                produces=[OutputKind.OBJECT_DETAILS],
                 input_schema=GetTimeInput.model_json_schema(),
                 output_schema={"type": "object"},
             ),
@@ -71,7 +76,8 @@ class SystemUtilityModule:
                 description="Create a local reminder using fully structured execution parameters.",
                 side_effect=True,
                 idempotent=False,
-                produces=[],
+                requires_confirmation=True,
+                produces=[OutputKind.MEMORY_SAVED],
                 input_schema=CreateReminderInput.model_json_schema(),
                 output_schema={"type": "object"},
             ),
@@ -81,7 +87,8 @@ class SystemUtilityModule:
                 description="Create a scheduled local task that will either notify the user or trigger a deferred agent action at the specified time.",
                 side_effect=True,
                 idempotent=False,
-                produces=[],
+                requires_confirmation=True,
+                produces=[OutputKind.MEMORY_SAVED],
                 input_schema=CreateScheduledTaskInput.model_json_schema(),
                 output_schema={"type": "object"},
             ),
@@ -91,7 +98,7 @@ class SystemUtilityModule:
                 description="List existing local reminders.",
                 side_effect=False,
                 idempotent=True,
-                produces=[],
+                produces=[OutputKind.MEMORY_ITEMS],
                 input_schema=ListRemindersInput.model_json_schema(),
                 output_schema={"type": "object"},
             ),
@@ -101,7 +108,8 @@ class SystemUtilityModule:
                 description="Cancel an existing local reminder.",
                 side_effect=True,
                 idempotent=False,
-                produces=[],
+                requires_confirmation=True,
+                produces=[OutputKind.OBJECT_DETAILS],
                 input_schema=CancelReminderInput.model_json_schema(),
                 output_schema={"type": "object"},
             ),
@@ -118,6 +126,46 @@ class SystemUtilityModule:
 
     def _resolve_timezone(self, timezone_name: str | None):
         return resolve_timezone(timezone_name, default_timezone=self.default_timezone)
+
+    @staticmethod
+    def _enrich_with_channel_context(
+        arguments: dict[str, Any],
+        context: "ToolUseContext | None",
+    ) -> dict[str, Any]:
+        """从 ToolUseContext.runtime_settings 自动补全 session_id / channel / channel_runtime。
+
+        这样 LLM 不需要感知这些字段，reminder fire 时就能原路返回。
+        """
+        if context is None:
+            return dict(arguments)
+
+        runtime_settings = context.runtime_settings
+        if not isinstance(runtime_settings, dict) or not runtime_settings:
+            return dict(arguments)
+
+        enriched = dict(arguments)
+
+        # 补全 session_id
+        if not str(enriched.get("session_id") or "").strip():
+            runtime_session_id = str(runtime_settings.get("session_id") or "").strip()
+            if runtime_session_id:
+                enriched["session_id"] = runtime_session_id
+
+        # 补全 channel：优先从 runtime_settings，其次从 context.channel
+        if not str(enriched.get("channel") or "").strip():
+            runtime_channel = str(runtime_settings.get("channel") or "").strip()
+            ctx_channel = str(context.channel or "").strip()
+            channel = runtime_channel or ctx_channel
+            if channel:
+                enriched["channel"] = channel
+
+        # 补全 task_payload 中的 channel_runtime（fire 时需要用来路由回 QQ）
+        task_payload = dict(enriched.get("task_payload") or {})
+        if not isinstance(task_payload.get("channel_runtime"), dict):
+            task_payload["channel_runtime"] = dict(runtime_settings)
+            enriched["task_payload"] = task_payload
+
+        return enriched
 
     def get_time(self, arguments: dict[str, Any]) -> dict[str, Any]:
         payload = GetTimeInput.model_validate(arguments)
@@ -158,7 +206,12 @@ class SystemUtilityModule:
             "timezone": str(tz),
         }
 
-    def create_scheduled_task(self, arguments: dict[str, Any]) -> dict[str, Any]:
+    def create_scheduled_task(
+        self,
+        arguments: dict[str, Any],
+        context: "ToolUseContext | None" = None,
+    ) -> dict[str, Any]:
+        arguments = self._enrich_with_channel_context(arguments, context)
         payload = CreateScheduledTaskInput.model_validate(arguments)
 
         try:
@@ -202,7 +255,12 @@ class SystemUtilityModule:
             "task": record,
         }
 
-    def create_reminder(self, arguments: dict[str, Any]) -> dict[str, Any]:
+    def create_reminder(
+        self,
+        arguments: dict[str, Any],
+        context: "ToolUseContext | None" = None,
+    ) -> dict[str, Any]:
+        arguments = self._enrich_with_channel_context(arguments, context)
         payload = CreateReminderInput.model_validate(arguments)
         result = self.create_scheduled_task(
             {

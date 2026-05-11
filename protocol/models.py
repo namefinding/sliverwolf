@@ -28,6 +28,17 @@ class RiskLevel(str, Enum):
     HIGH = "high"
 
 
+class ToolInterruptBehavior(str, Enum):
+    BLOCK = "block"
+    CANCEL = "cancel"
+
+
+class ToolPermissionMode(str, Enum):
+    ALLOW = "allow"
+    ASK = "ask"
+    DENY = "deny"
+
+
 class OutputKind(str, Enum):
     DIRECTORY_ENTRIES = "directory_entries"
     FILE_CONTENTS = "file_contents"
@@ -68,12 +79,24 @@ class ToolManifest(BaseModel):
     tool_name: str
     module: str
     description: str
+    aliases: list[str] = Field(default_factory=list)
+    search_hint: str = ""
     side_effect: bool = False
     idempotent: bool = True
+    read_only: bool = False
+    destructive: bool = False
+    concurrency_safe: bool = False
+    requires_confirmation: bool = False
+    default_permission: ToolPermissionMode = ToolPermissionMode.ALLOW
+    interrupt_behavior: ToolInterruptBehavior = ToolInterruptBehavior.BLOCK
     timeout_ms: int = 5_000
+    max_result_size_chars: int | None = None
     produces: list[OutputKind] = Field(default_factory=list)
     input_schema: dict[str, Any]
     output_schema: dict[str, Any]
+
+    def matches_name(self, name: str) -> bool:
+        return self.tool_name == name or name in self.aliases
 
 class ReminderRecord(BaseModel):
     reminder_id: str
@@ -90,6 +113,72 @@ class TaskGoal(BaseModel):
     summary: str = ""
     required_outputs: list[OutputKind] = Field(default_factory=list)
     completion_mode: str = "outputs"
+
+
+class ToolExecutionContext(BaseModel):
+    execution_brief: str = ""
+    required_outputs: list[OutputKind] = Field(default_factory=list)
+    grounded_inputs: dict[str, Any] = Field(default_factory=dict)
+    constraints: dict[str, Any] = Field(default_factory=dict)
+
+
+class ToolExecutionContextFields(BaseModel):
+    execution_brief: str = ""
+    required_outputs: list[OutputKind] = Field(default_factory=list)
+    grounded_inputs: dict[str, Any] = Field(default_factory=dict)
+    constraints: dict[str, Any] = Field(default_factory=dict)
+
+
+class ToolPermissionDecision(BaseModel):
+    behavior: ToolPermissionMode = ToolPermissionMode.ALLOW
+    reason: str = ""
+    updated_arguments: dict[str, Any] | None = None
+
+
+class ToolUseContext(BaseModel):
+    trace_id: str = ""
+    session_id: str = ""
+    channel: str | None = None
+    caller: str = "agent-kernel"
+    workspace_root: str = "."
+    permission_mode: str = "default"
+    access_policy: dict[str, Any] = Field(default_factory=dict)
+    runtime_settings: dict[str, Any] = Field(default_factory=dict)
+    required_outputs: list[OutputKind] = Field(default_factory=list)
+    completed_outputs: list[OutputKind] = Field(default_factory=list)
+    execution_brief: str = ""
+    grounded_inputs: dict[str, Any] = Field(default_factory=dict)
+    constraints: dict[str, Any] = Field(default_factory=dict)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @classmethod
+    def from_execution_context(
+        cls,
+        *,
+        trace_id: str,
+        session_id: str,
+        workspace_root: str,
+        execution_context: ToolExecutionContext,
+        channel: str | None = None,
+        access_policy: dict[str, Any] | None = None,
+        runtime_settings: dict[str, Any] | None = None,
+        completed_outputs: list[OutputKind] | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> "ToolUseContext":
+        return cls(
+            trace_id=trace_id,
+            session_id=session_id,
+            channel=channel,
+            workspace_root=workspace_root,
+            access_policy=dict(access_policy or {}),
+            runtime_settings=dict(runtime_settings or {}),
+            required_outputs=list(execution_context.required_outputs),
+            completed_outputs=list(completed_outputs or []),
+            execution_brief=execution_context.execution_brief,
+            grounded_inputs=dict(execution_context.grounded_inputs),
+            constraints=dict(execution_context.constraints),
+            metadata=dict(metadata or {}),
+        )
 
 class ToolDecision(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -437,6 +526,7 @@ class ToolCallRequest(BaseModel):
     session_id: str
     tool_name: str
     arguments: dict[str, Any]
+    execution_context: ToolExecutionContext = Field(default_factory=ToolExecutionContext)
     caller: str = "agent-kernel"
     timestamp: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
@@ -453,6 +543,8 @@ class ToolCallResult(BaseModel):
     tool_name: str | None = None
     status: str
     data: dict[str, Any] = Field(default_factory=dict)
+    produced_outputs: list[OutputKind] = Field(default_factory=list)
+    evidence: list[dict[str, Any]] = Field(default_factory=list)
     error: ToolError | None = None
     metrics: dict[str, Any] = Field(default_factory=dict)
 
@@ -518,11 +610,14 @@ class TaskRun(BaseModel):
 
 
 class AgentConfig(BaseModel):
+    llm_provider: str = "ollama"
     model: str
     chat_model: str | None = None
     critic_model: str | None = None
     response_model: str | None = None
     vision_model: str | None = None
+    api_base_url: str | None = None
+    api_key_env: str = "DEEPSEEK_API_KEY"
     ollama_keep_alive: str | None = "15m"
     persona_name: str = "Local Butler"
     assistant_aliases: list[str] = Field(default_factory=list)
@@ -546,6 +641,9 @@ class AgentConfig(BaseModel):
         "Avoid bracketed stage directions, action descriptions, and dramatic narration. "
         "Focus on the conclusion or next step, avoid long paths and long lists, and do not restate the full display text."
     )
+    fast_response_style_enabled: bool = True
+    fast_response_model: str | None = "qwen2.5:1.5b"
+    fast_response_timeout_seconds: int = 8
     live_turn_quiet_window_ms: int = 20000
     live_turn_incomplete_extra_ms: int = 450
     live_turn_attachment_extra_ms: int = 450
@@ -689,9 +787,30 @@ class OneBotConfig(BaseModel):
     progress_min_interval_ms: int = 2200
     progress_max_updates: int = 2
     recent_message_limit: int = 24
+    startup_history_sync_enabled: bool = True
+    startup_history_sync_group_count: int = 30
+    startup_history_sync_friend_count: int = 20
+    startup_history_sync_max_groups: int = 20
+    startup_history_sync_max_friends: int = 20
+    group_followup_window_ms: int = 20000
+    group_context_review_interval_ms: int = 600000
+    group_passive_min_interval_ms: int = 90000
+    group_passive_batch_message_count: int = 5
+    group_context_max_messages: int = 12
     full_access_user_ids: list[str] = Field(default_factory=list)
     owner_user_ids: list[str] = Field(default_factory=list)
     owner_display_name: str = "主人"
+
+
+class OverseerConfig(BaseModel):
+    enabled: bool = False
+    poll_interval_seconds: int = 30
+    min_poll_interval_seconds: int = 15
+    quiet_cooldown_seconds: int = 60
+    resize_width: int = 800
+    jpeg_quality: int = 30
+    qq_session_id: str = "onebot_private_2326478033"
+    persona_name: str = "银狼"
 
 
 class AppConfig(BaseModel):
@@ -701,3 +820,4 @@ class AppConfig(BaseModel):
     asr: ASRConfig = Field(default_factory=ASRConfig)
     web: WebConfig = Field(default_factory=WebConfig)
     onebot: OneBotConfig = Field(default_factory=OneBotConfig)
+    overseer: OverseerConfig = Field(default_factory=OverseerConfig)
