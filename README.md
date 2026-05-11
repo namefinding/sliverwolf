@@ -2,13 +2,15 @@
   <img src="https://img.shields.io/badge/python-3.12+-blue.svg" alt="Python 3.12+">
   <img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License MIT">
   <img src="https://img.shields.io/badge/platform-Windows-lightgrey.svg" alt="Windows">
-  <img src="https://img.shields.io/badge/PRs-welcome-brightgreen.svg" alt="PRs Welcome">
+  <img src="https://img.shields.io/badge/status-WIP-orange.svg" alt="Work in Progress">
 </p>
 
 <p align="center">
   <h3 align="center">🤖 Silverwolf — 本地 AI 智能管家</h3>
   <p align="center">一个跑在 Windows 上的本地 AI Agent，能听懂你说话、操作文件、上网搜索、收发 QQ 消息，还会记住你的偏好。</p>
 </p>
+
+> ⚠️ **这是一个个人自用的开发中项目**，并非面向公众发行的产品。代码仅代表当前开发进展，随时可能大改。不保证在任何环境下都能完美运行——遇到 Bug 是正常的，欢迎提 Issue，但不承诺修复时间。
 
 ---
 
@@ -132,7 +134,7 @@ voice_input:
   wake_word_enabled: true          # 开启"嗨银狼"唤醒词
 ```
 
-### 可选的：接入 QQ
+### 可选：接入 QQ
 
 需要提前部署 [LLOneBot](https://github.com/LLOneBot/LLOneBot) 或其他 OneBot 实现。
 
@@ -199,15 +201,26 @@ src/local_agent/
 | 过早完成拦截 | 要求产出文件但还没写入 → ExecutionCritic 不让结束 |
 | 全链路 Trace | 每一步记录在 JSONL 里，出问题可以回溯 |
 
-## 📋 待办 & 已知局限
+## ⚠️ 项目状态
 
-- [ ] 多用户并发支持（目前是单用户单会话设计）
+这个项目**正在活跃开发中**，是个人自用的实验性项目，**不是**面向公众发行的稳定产品。
+
+- 代码随时可能重构，不保证向后兼容
+- 功能可能在某个 commit 突然坏掉，过几天又修好
+- 你看到的代码只代表当前开发进度，不代表最终形态
+- 欢迎 Issue 和 PR，但不承诺响应时间
+- **不建议**直接拿它跑生产环境
+
+如果你在看我的代码来了解 Agent 系统的设计思路——那欢迎。如果你想 clone 下来玩——也欢迎，遇到问题可以提 Issue，修不修随缘 😄
+
+## 📋 已知局限 & 待办
+
+- [ ] 多用户并发支持（目前单用户单会话）
 - [ ] 系统化的离线评估 Benchmark
 - [ ] LLM 调用失败后的断点恢复
 - [ ] DecisionCritic 工具跳转规则的自动生成
 - [ ] 跨平台支持（目前部分功能 Windows only）
-
-欢迎提 Issue 和 PR。
+- [ ] 测试覆盖率偏低（目前 38 个用例，远不够）
 
 ## 📄 License
 
