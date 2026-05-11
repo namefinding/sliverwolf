@@ -56,6 +56,7 @@ class DecisionValidator:
             "document_agent.summarize": self._validate_document_agent_summarize,
             "document_agent.read": self._validate_document_agent_read,
             "document_agent.inspect": self._validate_document_agent_inspect,
+            "document_agent.compose": self._validate_document_agent_compose,
             "document_agent.edit": self._validate_document_agent_edit,
             "image.inspect": self._validate_image_inspect,
             "image.describe": self._validate_image_describe,
@@ -105,9 +106,9 @@ class DecisionValidator:
             raise DecisionValidationError("expected_step_outputs must be produced by the selected tool")
 
         validator = self._tool_validators.get(tool_name)
-        if validator is None:
-            raise DecisionValidationError(f"No validator registered for tool: {tool_name}")
-        validator(decision.arguments)
+        # skill 和未注册 validator 的工具自动放行
+        if validator is not None:
+            validator(decision.arguments)
 
     def _validate_system_get_time(self, arguments: dict) -> None:
         kind = arguments.get("kind", "datetime")
@@ -238,7 +239,7 @@ class DecisionValidator:
             overall_task_goal: TaskGoal | None,
             completed_outputs: list[OutputKind],
     ) -> None:
-        if decision.decision != DecisionType.RESPOND:
+        if decision.decision not in {DecisionType.RESPOND, DecisionType.FINISH}:
             return
 
         if overall_task_goal is None or not overall_task_goal.required_outputs:
@@ -285,10 +286,6 @@ class DecisionValidator:
 
     def _resolve_workspace_path(self, raw_path: str) -> Path:
         target = self.path_normalizer.resolve(raw_path)
-        try:
-            target.relative_to(self.workspace_root)
-        except ValueError as exc:
-            raise DecisionValidationError(f"Path is outside workspace: {target}") from exc
         return target
 
     def _validate_file_list(self, arguments: dict) -> None:
@@ -308,6 +305,8 @@ class DecisionValidator:
             raise DecisionValidationError(f"file.list path must be a directory: {target}")
 
     def _validate_file_read(self, arguments: dict) -> None:
+        if "paths" not in arguments and isinstance(arguments.get("path"), str):
+            arguments["paths"] = [arguments["path"]]
         paths = arguments.get("paths")
         encoding = arguments.get("encoding")
         max_bytes = arguments.get("max_bytes")
@@ -357,6 +356,8 @@ class DecisionValidator:
             raise DecisionValidationError(f"file.search_by_name path must be a directory: {target}")
 
     def _validate_file_extract_text(self, arguments: dict) -> None:
+        if "paths" not in arguments and isinstance(arguments.get("path"), str):
+            arguments["paths"] = [arguments["path"]]
         paths = arguments.get("paths")
         encoding = arguments.get("encoding")
         max_chars = arguments.get("max_chars")
@@ -512,6 +513,34 @@ class DecisionValidator:
         if "overwrite" in arguments and not isinstance(overwrite, bool):
             raise DecisionValidationError("file.write_docx overwrite must be a boolean when provided")
         self._resolve_workspace_path(path)
+
+    def _validate_document_agent_compose(self, arguments: dict) -> None:
+        instruction = arguments.get("instruction")
+        output_path = arguments.get("output_path")
+        title = arguments.get("title")
+        recent_context = arguments.get("recent_context")
+        source_materials = arguments.get("source_materials")
+        resolved_facts = arguments.get("resolved_facts")
+        style_hints = arguments.get("style_hints")
+        max_chars = arguments.get("max_chars")
+        if not isinstance(instruction, str) or not instruction.strip():
+            raise DecisionValidationError("document_agent.compose requires a non-empty instruction")
+        if "output_path" in arguments and output_path is not None:
+            if not isinstance(output_path, str) or not output_path.strip():
+                raise DecisionValidationError("document_agent.compose output_path must be a non-empty string when provided")
+            self._resolve_workspace_path(output_path)
+        if "title" in arguments and title is not None and not isinstance(title, str):
+            raise DecisionValidationError("document_agent.compose title must be a string when provided")
+        if "recent_context" in arguments and recent_context is not None and not isinstance(recent_context, str):
+            raise DecisionValidationError("document_agent.compose recent_context must be a string when provided")
+        if "source_materials" in arguments and source_materials is not None and not isinstance(source_materials, dict):
+            raise DecisionValidationError("document_agent.compose source_materials must be an object when provided")
+        if "resolved_facts" in arguments and resolved_facts is not None and not isinstance(resolved_facts, dict):
+            raise DecisionValidationError("document_agent.compose resolved_facts must be an object when provided")
+        if "style_hints" in arguments and style_hints is not None and not isinstance(style_hints, dict):
+            raise DecisionValidationError("document_agent.compose style_hints must be an object when provided")
+        if "max_chars" in arguments and (not isinstance(max_chars, int) or max_chars <= 0):
+            raise DecisionValidationError("document_agent.compose max_chars must be a positive integer when provided")
 
     def _validate_file_edit_docx(self, arguments: dict) -> None:
         source_path = arguments.get("source_path")

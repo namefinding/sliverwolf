@@ -70,6 +70,7 @@ class IntentService:
             knowledge_request=knowledge_request,
             document_delivery=document_delivery,
             site_search=site_search,
+            task_graph=task_graph,
         )
         answerability = self._derive_answerability(
             user_text=user_text,
@@ -262,10 +263,17 @@ class IntentService:
         knowledge_request,
         document_delivery,
         site_search,
+        task_graph,
     ) -> TaskClassification:
-        classification = RequestIntentAnalyzer._minimal_task_classification(
-            user_text=user_text,
+        graph_classification = self._classification_from_task_graph(
+            task_graph=task_graph,
             knowledge_type=str(getattr(knowledge_request, "knowledge_type", "") or ""),
+        )
+        if graph_classification is not None:
+            return graph_classification
+
+        classification = self._classification_from_structured_intents(
+            knowledge_request=knowledge_request,
             document_delivery=document_delivery,
             site_search=site_search,
         )
@@ -274,6 +282,137 @@ class IntentService:
         else:
             classification.rationale = f"short_circuit:{classification.rationale}"
         return classification
+
+    @staticmethod
+    def _classification_from_structured_intents(
+        *,
+        knowledge_request,
+        document_delivery,
+        site_search,
+    ) -> TaskClassification:
+        knowledge_type = str(getattr(knowledge_request, "knowledge_type", "") or "").strip().lower()
+        if knowledge_type == "qq_history":
+            return TaskClassification(
+                domain="qq_history",
+                task_kind="history_lookup",
+                preferred_families=["qq_history"],
+                confidence=0.68,
+                rationale="structured_intent_projection:qq_history",
+            )
+        if knowledge_type == "system_utility":
+            return TaskClassification(
+                domain="system_utility",
+                task_kind="system_utility",
+                preferred_families=["system_utility"],
+                confidence=0.56,
+                rationale="structured_intent_projection:system_utility",
+            )
+        if getattr(site_search, "site", None) or knowledge_type in {"general_external_topic", "time_sensitive_external_topic"}:
+            task_kind = "research_document" if bool(getattr(document_delivery, "save_output", False)) else "research"
+            return TaskClassification(
+                domain="web",
+                task_kind=task_kind,
+                preferred_families=["web_lookup", "web_target"],
+                confidence=0.64,
+                rationale="structured_intent_projection:web",
+            )
+        if knowledge_type == "local_workspace":
+            if bool(getattr(document_delivery, "save_output", False)):
+                return TaskClassification(
+                    domain="local_workspace",
+                    task_kind="document_edit",
+                    preferred_families=["document_operation", "local_lookup", "file_lookup"],
+                    confidence=0.62,
+                    rationale="structured_intent_projection:local_saved_document",
+                )
+            return TaskClassification(
+                domain="local_workspace",
+                task_kind="lookup",
+                preferred_families=["local_lookup", "file_lookup"],
+                confidence=0.52,
+                rationale="structured_intent_projection:local_lookup",
+            )
+        return TaskClassification(
+            domain="unknown",
+            task_kind="unknown",
+            preferred_families=[],
+            confidence=0.0,
+            rationale="structured_intent_projection:unknown",
+        )
+
+    @staticmethod
+    def _classification_from_task_graph(*, task_graph, knowledge_type: str) -> TaskClassification | None:
+        primary_subtask = IntentService._primary_task_graph_subtask(task_graph)
+        if primary_subtask is None:
+            return None
+        confidence = float(getattr(task_graph, "confidence", 0.0) or 0.0)
+        if confidence < 0.7:
+            return None
+
+        kind = str(getattr(primary_subtask, "kind", "") or "").strip().lower()
+        if not kind:
+            return None
+        knowledge = str(knowledge_type or "").strip().lower()
+
+        if kind in {"document_edit", "edit", "rewrite", "transform"}:
+            return TaskClassification(
+                domain="local_workspace",
+                task_kind="document_edit",
+                preferred_families=["document_operation", "local_lookup", "file_lookup"],
+                confidence=max(confidence, 0.82),
+                rationale="task_graph_primary_subtask:document_edit",
+            )
+        if kind in {"document_summary", "summarize"}:
+            return TaskClassification(
+                domain="local_workspace",
+                task_kind="document_summary",
+                preferred_families=["document_summary", "local_lookup", "file_lookup"],
+                confidence=max(confidence, 0.78),
+                rationale="task_graph_primary_subtask:document_summary",
+            )
+        if kind in {"qq_history", "history_lookup"}:
+            return TaskClassification(
+                domain="qq_history",
+                task_kind="history_lookup",
+                preferred_families=["qq_history"],
+                confidence=max(confidence, 0.78),
+                rationale="task_graph_primary_subtask:qq_history",
+            )
+        if kind in {"web_lookup", "web_research", "research"}:
+            return TaskClassification(
+                domain="web",
+                task_kind="research",
+                preferred_families=["web_lookup", "web_target"],
+                confidence=max(confidence, 0.78),
+                rationale="task_graph_primary_subtask:web_lookup",
+            )
+        if kind in {"system_utility", "reminder", "time_lookup"}:
+            return TaskClassification(
+                domain="system_utility",
+                task_kind="create_reminder" if kind == "reminder" else "system_utility",
+                preferred_families=["system_utility"],
+                confidence=max(confidence, 0.74),
+                rationale="task_graph_primary_subtask:system_utility",
+            )
+        if knowledge == "local_workspace" and kind in {"local_lookup", "file_lookup", "lookup"}:
+            return TaskClassification(
+                domain="local_workspace",
+                task_kind="lookup",
+                preferred_families=["local_lookup", "file_lookup"],
+                confidence=max(confidence, 0.72),
+                rationale="task_graph_primary_subtask:local_lookup",
+            )
+        return None
+
+    @staticmethod
+    def _primary_task_graph_subtask(task_graph):
+        primary_task_id = str(getattr(task_graph, "primary_task_id", "") or "").strip()
+        subtasks = list(getattr(task_graph, "subtasks", []) or [])
+        for subtask in subtasks:
+            subtask_id = str(getattr(subtask, "task_id", "") or "").strip()
+            if primary_task_id and subtask_id == primary_task_id:
+                return subtask
+        return subtasks[0] if subtasks else None
 
     @staticmethod
     def _derive_instruction_intent(memory_candidate: MemoryCandidateIntent) -> InstructionIntent:
@@ -471,6 +610,8 @@ class IntentService:
         response_strategy: str | None = None
 
         if save_output:
+            required_outputs.append(OutputKind.FILE_WRITTEN)
+        if task_kind in {"document_edit", "edit", "rewrite", "transform"} and OutputKind.FILE_WRITTEN not in required_outputs:
             required_outputs.append(OutputKind.FILE_WRITTEN)
 
         if knowledge_type == "local_workspace":

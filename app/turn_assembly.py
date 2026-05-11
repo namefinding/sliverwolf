@@ -235,6 +235,7 @@ class TurnAssemblyService:
         persona_name: str = "",
         now: datetime | None = None,
         use_llm_judge: bool = True,
+        has_prior_context: bool = False,
     ) -> TurnCompletionDecision:
         if state is None:
             return TurnCompletionDecision(finalize=False, confidence=0.0, wait_ms=0, reason="no_live_turn", source="rule")
@@ -297,19 +298,12 @@ class TurnAssemblyService:
                 source="rule",
             )
 
-        should_consult_llm_on_timeout = bool(
-            use_llm_judge
-            and llm_client is not None
-            and hasattr(llm_client, "classify_turn_completion")
-            and (looks_incomplete or looks_vague or likely_contextual_short_turn)
-        )
-
-        if silence_ms >= effective_idle_timeout_ms and not should_consult_llm_on_timeout:
+        if silence_ms >= target_quiet_ms:
             return TurnCompletionDecision(
                 finalize=True,
                 confidence=0.78,
                 wait_ms=0,
-                reason="idle_timeout_reached",
+                reason="quiet_window_elapsed",
                 source="rule",
             )
 
@@ -339,6 +333,7 @@ class TurnAssemblyService:
                     quiet_window_ms=target_quiet_ms,
                     idle_timeout_ms=effective_idle_timeout_ms,
                     persona_name=persona_name,
+                    has_prior_context=has_prior_context,
                 )
                 remaining_idle_ms = max(0, int((idle_deadline_at - observed_at).total_seconds() * 1000))
 
@@ -360,6 +355,41 @@ class TurnAssemblyService:
                 if not decision.finalize:
                     normalized_wait = max(0, min(remaining_idle_ms, max(400, int(decision.wait_ms or 0) or target_quiet_ms)))
                     followup_text = str(decision.followup_text or "").strip()
+                    idle_timeout_reached = remaining_idle_ms <= 0 or silence_ms >= effective_idle_timeout_ms
+                    if idle_timeout_reached:
+                        if has_prior_context and likely_contextual_short_turn:
+                            return decision.model_copy(
+                                update={
+                                    "finalize": True,
+                                    "confidence": max(0.62, decision.confidence),
+                                    "wait_ms": 0,
+                                    "reason": decision.reason or "contextual_short_turn_idle_timeout",
+                                    "source": "rule",
+                                    "ask_followup": False,
+                                    "followup_text": "",
+                                }
+                            )
+                        if not followup_prompt_sent:
+                            if not followup_text:
+                                followup_text = self._build_generic_followup_text(state, decision)
+                            return decision.model_copy(
+                                update={
+                                    "wait_ms": 0,
+                                    "ask_followup": True,
+                                    "followup_text": followup_text,
+                                }
+                            )
+                        return decision.model_copy(
+                            update={
+                                "finalize": True,
+                                "confidence": max(0.55, decision.confidence),
+                                "wait_ms": 0,
+                                "reason": decision.reason or "idle_timeout_after_followup",
+                                "source": "rule",
+                                "ask_followup": False,
+                                "followup_text": "",
+                            }
+                        )
                     ask_followup = (
                         decision.confidence >= 0.82
                         and silence_ms >= target_quiet_ms

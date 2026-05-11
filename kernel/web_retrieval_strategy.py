@@ -274,6 +274,18 @@ class WebRetrievalStrategy:
             return "research"
         if site_search_intent is not None and site_search_intent.site and site_search_intent.query:
             return "research"
+        if (
+            site_search_intent is not None
+            and site_search_intent.query
+            and knowledge_intent is not None
+            and knowledge_intent.knowledge_type not in {"local_workspace", "qq_history"}
+            and (
+                knowledge_intent.needs_grounding
+                or knowledge_intent.time_sensitive
+                or knowledge_intent.lookup_requested
+            )
+        ):
+            return "research"
         if cls._should_start_with_research(
             user_text=user_text,
             query_type=query_type,

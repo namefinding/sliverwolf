@@ -470,24 +470,28 @@ class FileRetrievalStrategy:
             return []
         if file_type_hints:
             return file_type_hints
-        if any(
-            term in lowered
-            for term in ("png", "jpg", "jpeg", "webp", "gif", "bmp", "image", "picture", "photo", "screenshot", "图片", "照片", "截图", "图像")
-        ):
+        explicit_exts = [
+            ext
+            for ext in (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".docx", ".pptx", ".xlsx", ".csv", ".md", ".pdf", ".txt", ".log")
+            if ext in lowered
+        ]
+        if explicit_exts:
+            return cls._dedupe_preserve_order(explicit_exts)
+        if re.search(r"(?<![a-z0-9])(?:image|picture|photo|screenshot)(?![a-z0-9])", lowered):
             return [".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"]
-        if ".docx" in lowered or "word" in lowered:
+        if re.search(r"(?<![a-z0-9])word(?![a-z0-9])", lowered):
             return [".docx"]
-        if ".pptx" in lowered or "ppt" in lowered or "presentation" in lowered or "演示" in lowered:
+        if re.search(r"(?<![a-z0-9])(?:ppt|powerpoint|presentation)(?![a-z0-9])", lowered):
             return [".pptx"]
-        if ".xlsx" in lowered or ".csv" in lowered or "excel" in lowered or "spreadsheet" in lowered or "表格" in lowered:
+        if re.search(r"(?<![a-z0-9])(?:excel|spreadsheet)(?![a-z0-9])", lowered):
             return [".xlsx", ".csv"]
-        if ".md" in lowered or "markdown" in lowered:
+        if re.search(r"(?<![a-z0-9])markdown(?![a-z0-9])", lowered):
             return [".md"]
-        if ".pdf" in lowered or re.search(r"(?<![a-z0-9])pdf(?![a-z0-9])", lowered):
+        if re.search(r"(?<![a-z0-9])pdf(?![a-z0-9])", lowered):
             return [".pdf"]
-        if ".txt" in lowered:
+        if re.search(r"(?<![a-z0-9])txt(?![a-z0-9])", lowered):
             return [".txt"]
-        if ".log" in lowered or "日志文件" in lowered or "日志格式" in lowered or "log file" in lowered:
+        if re.search(r"(?<![a-z0-9])log file(?![a-z0-9])", lowered):
             return [".log"]
         return []
 

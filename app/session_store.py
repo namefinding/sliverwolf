@@ -30,6 +30,9 @@ class SessionState:
     last_finalized_turn_id: str | None = None
     last_finalized_turn_text: str = ""
     recent_turn_texts: list[str] = field(default_factory=list)
+    recent_artifacts: list[dict] = field(default_factory=list)
+    last_memory_update: dict | None = None
+    last_route_decision: dict | None = None
 
     def touch(self, mode: str) -> None:
         self.last_mode = mode
@@ -67,7 +70,7 @@ class InMemorySessionStore:
             session = self._sessions.get(session_id)
             normalized_scope = scope_root
             settings_signature = json.dumps(runtime_settings or {}, ensure_ascii=False, sort_keys=True)
-            if session is None or session.scope_root != normalized_scope or session.settings_signature != settings_signature:
+            if session is None or session.scope_root != normalized_scope:
                 if len(self._sessions) >= self.max_sessions:
                     self._evict_oldest_locked()
                 last_mode = session.last_mode if session is not None else "chat"
@@ -75,6 +78,12 @@ class InMemorySessionStore:
                 context_tasks = list(session.context_tasks) if session is not None else []
                 active_context_task = session.active_context_task if session is not None else None
                 pending_follow_up_assessment = session.pending_follow_up_assessment if session is not None else None
+                last_finalized_turn_id = session.last_finalized_turn_id if session is not None else None
+                last_finalized_turn_text = session.last_finalized_turn_text if session is not None else ""
+                recent_turn_texts = list(session.recent_turn_texts) if session is not None else []
+                recent_artifacts = [dict(item) for item in session.recent_artifacts] if session is not None else []
+                last_memory_update = dict(session.last_memory_update) if session is not None and isinstance(session.last_memory_update, dict) else None
+                last_route_decision = dict(session.last_route_decision) if session is not None and isinstance(session.last_route_decision, dict) else None
                 session = SessionState(
                     session_id=session_id,
                     kernel=self._invoke_factory(factory, normalized_scope, runtime_settings),
@@ -86,6 +95,12 @@ class InMemorySessionStore:
                     context_tasks=context_tasks,
                     active_context_task=active_context_task,
                     pending_follow_up_assessment=pending_follow_up_assessment,
+                    last_finalized_turn_id=last_finalized_turn_id,
+                    last_finalized_turn_text=last_finalized_turn_text,
+                    recent_turn_texts=recent_turn_texts,
+                    recent_artifacts=recent_artifacts,
+                    last_memory_update=last_memory_update,
+                    last_route_decision=last_route_decision,
                 )
                 self._sessions[session_id] = session
             return session

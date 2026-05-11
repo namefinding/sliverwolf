@@ -8,6 +8,7 @@ from local_agent.app.config import load_config
 from local_agent.kernel.agent_kernel import AgentKernel
 from local_agent.llm.ollama_client import OllamaClient
 from local_agent.modules.base import ToolRegistry
+from local_agent.modules.app_control.service import AppControlModule
 from local_agent.modules.computer_use.service import ComputerUseModule
 from local_agent.modules.document_agent.service import DocumentAgentModule
 from local_agent.modules.file.service import FileModule
@@ -29,9 +30,14 @@ from local_agent.retrieval.hybrid_index import (
 from local_agent.modules.system_utility.service import SystemUtilityModule
 from local_agent.modules.system_utility.reminder_store import ReminderStore
 from local_agent.modules.system_utility.scheduler import ReminderScheduler
+from local_agent.skills.registry import register_skills
 
 
-def apply_session_identity_overrides(agent_config, access_policy: dict | None) -> None:
+def apply_session_identity_overrides(
+    agent_config,
+    access_policy: dict | None,
+    channel_runtime: dict | None = None,
+) -> None:
     if not isinstance(access_policy, dict):
         return
 
@@ -61,6 +67,38 @@ def apply_session_identity_overrides(agent_config, access_policy: dict | None) -
         owner_line += f"是你的主人。自然地把对方称作{address_as}，但不要每句话都重复。"
         identity_lines.append(owner_line)
 
+    current_target = {}
+    if isinstance(channel_runtime, dict) and isinstance(channel_runtime.get("current_target"), dict):
+        current_target = channel_runtime.get("current_target") or {}
+    message_type = str(current_target.get("message_type") or "").strip().lower()
+    is_group_chat = message_type == "group"
+    runtime = channel_runtime if isinstance(channel_runtime, dict) else {}
+    sender_id = str(access_policy.get("sender_id") or "").strip()
+    sender_name = str(runtime.get("sender_name") or "").strip()
+    owner_name = str(access_policy.get("address_as") or "主人").strip() or "主人"
+
+    if is_group_chat:
+        identity_lines.extend(
+            [
+                "当前是 QQ 群聊场景：你是群里的自然成员，不是客服。优先短回复、低频回复、少抢话；没有被点名、没有人在接你的话、也没有明显需要你帮忙时，可以先观察。",
+                "群聊里要区分不同发言人和上下文，不要把 A 的话当成 B 的话，也不要把群里的共识说成某个群友的观点。",
+                "不要把私聊记忆、私聊称呼、私人文件内容或用户偏好主动暴露到群里，除非主人或相关当事人明确要求。",
+            ]
+        )
+        who = f"当前发言人 QQ 用户{sender_id}" if sender_id else "当前发言人"
+        if sender_name:
+            who += f"（{sender_name}）"
+        if bool(access_policy.get("is_owner")):
+            identity_lines.append(f"{who}是主人；这次如果自然需要称呼对方，可以叫{owner_name}，但不要每句都叫。")
+        else:
+            identity_lines.append(f"{who}不是主人；回复这个人时绝不能称呼为{owner_name}，优先用对方昵称、群友、你，或不加称呼。")
+        identity_lines.append("群聊表情包可以更活泼一点，但不要刷屏；严肃、争执、报错、隐私话题不要发。")
+    else:
+        if bool(access_policy.get("is_owner")):
+            identity_lines.append(f"当前是 QQ 私聊；保持现有私聊老搭档语气，可以自然称呼对方为{owner_name}，但不要每句话都重复。")
+        else:
+            identity_lines.append(f"当前是 QQ 私聊，但对方不是主人；不要称呼对方为{owner_name}。")
+
     if not identity_lines:
         return
 
@@ -70,6 +108,24 @@ def apply_session_identity_overrides(agent_config, access_policy: dict | None) -
             continue
         current_profile = f"{current_profile}\n{line}".strip() if current_profile else line
     agent_config.persona_profile = current_profile
+
+    style_lines: list[str] = []
+    if is_group_chat:
+        style_lines.extend(
+            [
+                "群聊补充规则：短句优先，不要小作文；自然参与但别刷存在感。",
+                f"称呼只按当前 sender 判断：主人只用于 owner_user_ids 对应的人，其他群友不要叫{owner_name}。",
+                "不要输出括号动作文本；想表达情绪就正常说话或由表情包工具补充。",
+            ]
+        )
+    else:
+        style_lines.append("私聊补充规则：保留现有私聊语气和称呼习惯；不要套用群聊少抢话规则。")
+    current_style = str(getattr(agent_config, "chat_style_prompt", "") or "").strip()
+    for line in style_lines:
+        if line in current_style:
+            continue
+        current_style = f"{current_style}\n{line}".strip() if current_style else line
+    agent_config.chat_style_prompt = current_style
 
 
 def _scoped_retrieval_db_path(config, workspace_root: str) -> str:
@@ -123,6 +179,14 @@ def build_retrieval_service(
         workspace_root,
         embedding_provider=embedding_provider,
         reranker_provider=reranker_provider,
+        extra_index_roots=[
+            # 代码库
+            "C:/Users/namef/PycharmProjects/PythonProject/src",
+            "C:/Users/namef/PycharmProjects/PythonProject/tests",
+            "C:/Users/namef/PycharmProjects/PythonProject/scripts",
+            # 资源
+            "C:/Users/namef/PycharmProjects/PythonProject/data/stickers",
+        ],
     )
 
 
@@ -144,7 +208,7 @@ def build_kernel(
             if hasattr(agent_config, key):
                 setattr(agent_config, key, value)
     if isinstance(policy_overrides, dict):
-        apply_session_identity_overrides(agent_config, policy_overrides)
+        apply_session_identity_overrides(agent_config, policy_overrides, channel_runtime=channel_runtime)
     memory_store = SQLiteMemoryStore(agent_config.memory_db_path)
     trace_store = JsonlTraceStore(agent_config.trace_path)
     retrieval_service = build_retrieval_service(
@@ -161,6 +225,9 @@ def build_kernel(
         response_model=agent_config.response_model,
         vision_model=agent_config.vision_model,
         keep_alive=agent_config.ollama_keep_alive,
+        provider=agent_config.llm_provider,
+        api_base_url=agent_config.api_base_url,
+        api_key_env=agent_config.api_key_env,
     )
     voice_config = config.voice.model_copy(deep=True)
     if isinstance(voice_overrides, dict):
@@ -180,6 +247,7 @@ def build_kernel(
     web_module = WebModule(config=config.web)
     retrieval_module = RetrievalModule(index_service=retrieval_service)
     computer_use_module = ComputerUseModule(workspace_root=workspace_root)
+    app_control_module = AppControlModule()
     qq_runtime_context = dict(channel_runtime or {})
 
     reminder_store = ReminderStore("data/reminders.sqlite3")
@@ -204,6 +272,7 @@ def build_kernel(
             retrieval_module,
             system_utility_module,
             computer_use_module,
+            # app_control_module,  # QQ音乐 GUI 控制暂时搁置
         ]
     if qq_module.runtime is not None:
         modules.append(qq_module)
@@ -211,6 +280,9 @@ def build_kernel(
         executors = module.executor_map()
         for manifest in module.manifests():
             registry.register(manifest, executors[manifest.tool_name])
+
+    # 自动扫描 skills/ 目录注册所有 skill
+    register_skills(registry)
 
     kernel = AgentKernel(
         config=agent_config,

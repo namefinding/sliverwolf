@@ -66,7 +66,7 @@ class QQDomainAgent:
 
         intent_label = str(getattr(assessment, "intent_label", "send_message") or "send_message").strip().lower()
         if intent_label not in {"send_message", "notify", "remind", "relay"}:
-            intent_label = "send_message"
+            return None
         return OneBotProxySendRequest(
             recipient_query=recipient_query,
             message_body=message_body,

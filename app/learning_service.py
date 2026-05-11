@@ -72,6 +72,8 @@ class RealTurnLearningService:
         execution_summary = {}
         if isinstance(turn_result.metadata, dict):
             execution_summary = turn_result.metadata.get("execution_summary") or {}
+        if not self._is_true_success(turn_result, execution_summary):
+            return []
 
         learned: list[LearnedMemory] = []
         drafted = self._build_memories(normalized, turn_result, execution_summary)
@@ -375,6 +377,8 @@ class RealTurnLearningService:
             return False
         if required_outputs and not required_outputs.issubset(completed_outputs):
             return False
+        if self._has_barren_web_research_result(execution_summary):
+            return False
         if self._looks_like_scope_leak("", execution_summary):
             return False
         if task_kind in {"summarize", "document_summary"} and "file_contents" not in completed_outputs:
@@ -386,6 +390,25 @@ class RealTurnLearningService:
         if completed_outputs == {"object_candidates"}:
             return task_kind in {"lookup", "file_lookup", "local_lookup"}
         return bool(completed_outputs or self._tool_names(execution_summary))
+
+    @staticmethod
+    def _has_barren_web_research_result(execution_summary: dict) -> bool:
+        required_outputs = RealTurnLearningService._normalize_outputs(
+            ((execution_summary.get("overall_task_goal") or {}).get("required_outputs") or [])
+        )
+        web_required = bool({"search_results", "web_content"} & required_outputs)
+        if not web_required:
+            return False
+        for action in execution_summary.get("successful_actions") or []:
+            if not isinstance(action, dict) or action.get("tool_name") != "web.research":
+                continue
+            data = action.get("data") if isinstance(action.get("data"), dict) else {}
+            content = str(data.get("content") or "").strip()
+            sources = data.get("sources") if isinstance(data.get("sources"), list) else []
+            if content or sources:
+                continue
+            return True
+        return False
 
     @staticmethod
     def _looks_like_scope_leak(user_text: str, execution_summary: dict) -> bool:

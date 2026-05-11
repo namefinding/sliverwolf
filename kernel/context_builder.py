@@ -8,6 +8,10 @@ class ContextBuilder:
     def build_observations(tool_results: list[ToolCallResult]) -> list[str]:
         observations: list[str] = []
         for result in tool_results:
+            runtime_observation = result.metrics.get("observation") if isinstance(result.metrics, dict) else None
+            if isinstance(runtime_observation, str) and runtime_observation.strip():
+                observations.append(runtime_observation.strip())
+                continue
             if result.status == "success":
                 observations.append(ContextBuilder._format_success_observation(result))
             else:

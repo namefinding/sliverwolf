@@ -10,7 +10,7 @@ from local_agent.protocol.models import (
     OutputKind,
     SiteSearchIntent,
     TaskGraphIntent,
-    ToolDecision,
+    WorkflowSpec,
 )
 
 
@@ -51,6 +51,7 @@ class TaskEnvelope(BaseModel):
     tool_order_constraints: list[str] = Field(default_factory=list)
     response_strategy: str | None = None
     delegated_execution_brief: str | None = None
+    workflow_spec: WorkflowSpec | None = None
     subtask_count: int = 0
     rationale: str = ""
 
@@ -74,14 +75,6 @@ class IntentBundle(BaseModel):
     answerability: AnswerabilityAssessment = Field(default_factory=AnswerabilityAssessment)
     task_classification: TaskClassification | None = None
     task_envelope: TaskEnvelope = Field(default_factory=TaskEnvelope)
-
-
-class WorkflowProposal(BaseModel):
-    source: str
-    family: str
-    priority: int = 0
-    reason: str = ""
-    decision: ToolDecision | None = None
 
 
 class LocalCollectionIntent(BaseModel):

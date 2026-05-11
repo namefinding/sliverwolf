@@ -32,6 +32,7 @@ from local_agent.app.onebot_contacts import (
 )
 from local_agent.app.onebot_delivery import (
     build_file_action,
+    build_image_action,
     build_reply_action,
     build_voice_action,
     extract_delivery_file_paths,
@@ -52,6 +53,7 @@ from local_agent.llm.ollama_client import OllamaClient
 from local_agent.voice.asr_service import ASRService
 from local_agent.voice.input_service import VoiceInputService
 from local_agent.voice.output_service import VoiceOutputService
+from local_agent.modules.overseer.service import OverseerService
 
 
 class _QQProgressUpdateController:
@@ -140,6 +142,9 @@ class QQBotGatewayClient:
         flags=re.IGNORECASE,
     )
 
+    _STAGE_DIRECTION_LINE_PATTERN = re.compile(r"(?m)^\s*(?:[\(（【\[]([^()\[\]（）【】\n]{1,24})[\)）】\]]|\*([^*\n]{1,30})\*)\s*$")
+    _TRAILING_STAGE_DIRECTION_PATTERN = re.compile(r"(?:\s*[\(（]([^()（）\n]{1,24})[\)）]\s*)+$")
+
     def __init__(self, *, config_path: str) -> None:
         self.app = bootstrap_resident_app(
             config_path=config_path,
@@ -165,6 +170,9 @@ class QQBotGatewayClient:
             critic_model=self.app.config.agent.critic_model,
             response_model=self.app.config.agent.response_model,
             keep_alive=self.app.config.agent.ollama_keep_alive,
+            provider=self.app.config.agent.llm_provider,
+            api_base_url=self.app.config.agent.api_base_url,
+            api_key_env=self.app.config.agent.api_key_env,
         )
         self._message_composer = MessageComposer(
             llm_client=self._llm_client,
@@ -178,15 +186,67 @@ class QQBotGatewayClient:
         self._recent_messages: dict[str, list[dict[str, Any]]] = {}
         self._proxy_threads_lock = Lock()
         self._proxy_threads: dict[str, dict[str, Any]] = {}
+        # 队列模式：同一 session 的消息合并，避免一条一回
+        self._session_queues: dict[str, list[OneBotInboundMessage]] = {}
+        self._session_locks: dict[str, asyncio.Lock] = {}
+        self._session_busy: dict[str, bool] = {}
+        self._session_last_msg_at: dict[str, float] = {}
+        self._session_typing_active: dict[str, bool] = {}
         self._coalesce_lock = asyncio.Lock()
         self._pending_inbound_batches: dict[str, list[OneBotInboundMessage]] = {}
         self._pending_inbound_versions: dict[str, int] = {}
+        self._group_passive_buffers: dict[str, list[OneBotInboundMessage]] = {}
+        self._group_followup_until: dict[str, float] = {}
+        self._group_last_passive_dispatch_at: dict[str, float] = {}
+        self._group_last_context_review_key: dict[str, str] = {}
+        # 正在处理中的 session 的后到消息队列
+        self._session_pending: dict[str, list[OneBotInboundMessage]] = {}
+        self._session_processing: dict[str, bool] = {}
+        self._session_lock = asyncio.Lock()
         self._runtime_id = f"onebot_runtime_{uuid4().hex[:12]}"
         self._connection_lock = Lock()
         self._active_loop = None
         self._active_websocket = None
         self._history_store = QQHistoryStore(str(self._qq_history_db_path(config_path, self.app.config.agent.memory_db_path)))
         QQRuntimeRegistry.register(self._runtime_id, self)
+
+        # Overseer: 后台视觉感知
+        self._overseer = None
+        overseer_cfg = getattr(self.app.config, "overseer", None)
+        if overseer_cfg is not None and overseer_cfg.enabled:
+            def _overseer_send_to_qq(*, message: str, session_id: str) -> None:
+                loop = getattr(self, "_active_loop", None)
+                ws = getattr(self, "_active_websocket", None)
+                if loop is None or ws is None:
+                    return
+                # 构造 target from session_id
+                if session_id.startswith("onebot_private_"):
+                    user_id = session_id.replace("onebot_private_", "")
+                    target = OneBotTarget(message_type="private", user_id=int(user_id))
+                elif session_id.startswith("onebot_group_"):
+                    group_id = session_id.replace("onebot_group_", "")
+                    target = OneBotTarget(message_type="group", group_id=int(group_id))
+                else:
+                    return
+                async def _send():
+                    async with self._send_lock:
+                        await ws.send(json.dumps(build_reply_action(target, message), ensure_ascii=False))
+                asyncio.run_coroutine_threadsafe(_send(), loop)
+
+            trace_store = getattr(
+                getattr(getattr(self.app, "chat_service", None), "session_store", None),
+                "write_trace",
+                None,
+            )
+            # Actually trace_store is on the kernel level. Let's use None for now and let overseer log to console.
+            self._overseer = OverseerService(
+                config=overseer_cfg,
+                llm_client=self._llm_client,
+                send_to_qq=_overseer_send_to_qq,
+                trace_store=None,  # trace 暂不写，先用 print
+            )
+            self._overseer.start()
+            print("[overseer] started")
 
     async def run_forever(self) -> None:
         if not self.onebot_cfg.enabled:
@@ -214,6 +274,11 @@ class QQBotGatewayClient:
         ) as websocket:
             print("[onebot] connected")
             self._set_active_connection(asyncio.get_running_loop(), websocket)
+            startup_groups = await self._sync_startup_history(websocket)
+            startup_groups = startup_groups or []
+            for contact in startup_groups:
+                await self._dispatch_group_context_review(websocket, contact, reason="startup")
+            group_review_task = asyncio.create_task(self._periodic_group_context_review_loop(websocket))
             active_tasks: set[asyncio.Task] = set()
             try:
                 async for raw in websocket:
@@ -228,7 +293,19 @@ class QQBotGatewayClient:
                     if typing_notice is not None:
                         await self._handle_typing_notice(typing_notice)
                         continue
-                    inbound = extract_onebot_message(payload)
+                    # 先解析消息（不管要不要 dispatch），记录所有群聊消息到历史
+                    raw_inbound = extract_onebot_message(
+                        payload,
+                        assistant_aliases=self._assistant_recipient_aliases(),
+                    )
+                    if raw_inbound is not None:
+                        self._record_inbound_history(raw_inbound)
+
+                    # 再按权限过滤，决定要不要 dispatch
+                    inbound = extract_onebot_message(
+                        payload,
+                        assistant_aliases=self._assistant_recipient_aliases(),
+                    )
                     if inbound is None:
                         continue
                     task = asyncio.create_task(self._handle_inbound(websocket, inbound))
@@ -238,6 +315,9 @@ class QQBotGatewayClient:
                 raise
             finally:
                 self._clear_active_connection(websocket)
+                group_review_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await group_review_task
                 for echo, future in list(self._action_waiters.items()):
                     if not future.done():
                         future.cancel()
@@ -271,6 +351,290 @@ class QQBotGatewayClient:
             future.set_result(payload)
         return True
 
+    async def _sync_startup_history(self, websocket) -> list[OneBotContact]:
+        if not bool(getattr(self.onebot_cfg, "startup_history_sync_enabled", True)):
+            return []
+        if getattr(self, "_history_store", None) is None:
+            return []
+        try:
+            contacts = await self._load_contacts(websocket, direct_receive=True)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[onebot] startup history sync skipped: {exc}")
+            return []
+
+        group_count = max(0, int(getattr(self.onebot_cfg, "startup_history_sync_group_count", 30) or 0))
+        friend_count = max(0, int(getattr(self.onebot_cfg, "startup_history_sync_friend_count", 20) or 0))
+        groups = [item for item in contacts if item.kind == "group"][: max(0, int(getattr(self.onebot_cfg, "startup_history_sync_max_groups", 20) or 0))]
+        friends = [item for item in contacts if item.kind == "friend"][: max(0, int(getattr(self.onebot_cfg, "startup_history_sync_max_friends", 20) or 0))]
+        imported = 0
+        for contact in groups:
+            imported += await self._sync_contact_history(
+                websocket,
+                contact,
+                action="get_group_msg_history",
+                params={"group_id": contact.target_id, "count": group_count},
+                direct_receive=True,
+            )
+        for contact in friends:
+            imported += await self._sync_contact_history(
+                websocket,
+                contact,
+                action="get_friend_msg_history",
+                params={"user_id": contact.target_id, "count": friend_count},
+                direct_receive=True,
+            )
+        print(f"[onebot] startup history sync imported {imported} messages")
+        return groups
+
+    async def _periodic_group_context_review_loop(self, websocket) -> None:
+        while True:
+            await asyncio.sleep(self._group_context_review_interval_seconds())
+            try:
+                contacts = await self._load_contacts(websocket)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[onebot] group context review skipped: {exc}")
+                continue
+            group_count = max(0, int(getattr(self.onebot_cfg, "startup_history_sync_group_count", 30) or 0))
+            max_groups = max(0, int(getattr(self.onebot_cfg, "startup_history_sync_max_groups", 20) or 0))
+            groups = [item for item in contacts if item.kind == "group"][:max_groups]
+            for contact in groups:
+                await self._sync_contact_history(
+                    websocket,
+                    contact,
+                    action="get_group_msg_history",
+                    params={"group_id": contact.target_id, "count": group_count},
+                )
+                await self._dispatch_group_context_review(websocket, contact, reason="periodic")
+
+    async def _sync_contact_history(
+        self,
+        websocket,
+        contact: OneBotContact,
+        *,
+        action: str,
+        params: dict[str, Any],
+        direct_receive: bool = False,
+    ) -> int:
+        if int(params.get("count") or 0) <= 0:
+            return 0
+        try:
+            result = await self._call_action_direct(websocket, action=action, params=params) if direct_receive else await self._call_action(websocket, action=action, params=params)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[onebot] startup history sync failed for {contact.kind} {contact.target_id}: {exc}")
+            return 0
+        imported = 0
+        for payload in self._extract_history_messages(result):
+            inbound = self._history_payload_to_inbound(contact, payload)
+            if inbound is None or self._history_message_already_recorded(inbound):
+                continue
+            self._record_inbound_history(inbound, metadata_extra={"startup_history_sync": True})
+            self._remember_recent_message(
+                inbound.session_id,
+                role="user",
+                text=inbound.text,
+                sender_id=inbound.sender_id,
+                sender_name=self._sender_name_from_inbound(inbound),
+                image_attachments=inbound.image_attachments,
+            )
+            if inbound.target.message_type == "group":
+                self._append_to_group_passive_buffer(inbound)
+            imported += 1
+        return imported
+
+    async def _sync_group_history_for_inbound(self, websocket, inbound: OneBotInboundMessage) -> int:
+        group_id = inbound.target.group_id
+        if inbound.target.message_type != "group" or group_id is None:
+            return 0
+        count = max(self._group_context_limit(), int(getattr(self.onebot_cfg, "startup_history_sync_group_count", 30) or 0))
+        contact = OneBotContact(kind="group", target_id=int(group_id), name=self._contact_name_for_session(inbound.session_id) or "")
+        return await self._sync_contact_history(
+            websocket,
+            contact,
+            action="get_group_msg_history",
+            params={"group_id": int(group_id), "count": count},
+        )
+
+    async def _dispatch_group_context_review(self, websocket, contact: OneBotContact, *, reason: str) -> bool:
+        if contact.kind != "group":
+            return False
+        session_id = f"onebot_group_{contact.target_id}"
+        review_key = self._latest_group_context_review_key(session_id)
+        if not review_key or self._group_last_context_review_key.get(session_id) == review_key:
+            return False
+        context_messages = self._group_context_messages(session_id, limit=self._group_context_limit())
+        if not context_messages:
+            return False
+        self._group_last_context_review_key[session_id] = review_key
+        inbound = OneBotInboundMessage(
+            session_id=session_id,
+            text=self._build_group_context_review_text(context_messages),
+            sender_id="group_context_review",
+            mode="chat",
+            scope_root=None,
+            target=OneBotTarget(message_type="group", group_id=contact.target_id),
+            metadata={
+                "group_context_review": True,
+                "group_reply_policy": "optional",
+                "group_dispatch_trigger": "look_group_reply",
+                "group_context_messages": context_messages,
+                "review_reason": reason,
+            },
+        )
+        self._append_live_turn_trace(
+            session_id,
+            "group_context_review_start",
+            {"session_id": session_id, "reason": reason, "message_count": len(context_messages)},
+        )
+        reply = await asyncio.to_thread(self._dispatch_message, inbound, None)
+        self._append_live_turn_trace(
+            session_id,
+            "group_context_review_done",
+            {
+                "session_id": session_id,
+                "reason": reason,
+                "has_response": bool(str(getattr(reply, "response", "") or "").strip()),
+            },
+        )
+        if reply is not None and self.onebot_cfg.send_replies and str(getattr(reply, "response", "") or "").strip():
+            await self._send_generated_reply(websocket, inbound, reply)
+        return True
+
+    def _latest_group_context_review_key(self, session_id: str) -> str:
+        recent = self.get_recent_messages(
+            session_id=session_id,
+            limit=max(self._group_context_limit() * 2, 12),
+            include_assistant=False,
+        )
+        for item in reversed(recent):
+            if not isinstance(item, dict):
+                continue
+            text = self._normalize_recent_group_text(item.get("text"))
+            if not text:
+                continue
+            return "|".join(
+                [
+                    str(item.get("created_at") or "").strip(),
+                    str(item.get("sender_id") or "").strip(),
+                    text,
+                ]
+            )
+        return ""
+
+    def _build_group_context_review_text(self, context_messages: list[dict[str, Any]]) -> str:
+        lines = [
+            "这是一次群聊看群回复。请结合最近群聊上下文判断现在是否值得自然插一句；如果不值得回复，请只输出 __NO_REPLY__。",
+        ]
+        for item in context_messages[-self._group_context_limit():]:
+            if not isinstance(item, dict):
+                continue
+            text = self._normalize_recent_group_text(item.get("text"))
+            if not text:
+                continue
+            sender = str(item.get("sender_name") or item.get("sender_id") or item.get("role") or "群聊成员").strip()
+            lines.append(f"{sender}: {text}")
+        return "\n".join(lines).strip()
+
+    @staticmethod
+    def _extract_history_messages(result: dict[str, Any]) -> list[dict[str, Any]]:
+        data = result.get("data") if isinstance(result, dict) else None
+        if isinstance(data, list):
+            return [item for item in data if isinstance(item, dict)]
+        if isinstance(data, dict):
+            for key in ("messages", "message", "data"):
+                value = data.get(key)
+                if isinstance(value, list):
+                    return [item for item in value if isinstance(item, dict)]
+        return []
+
+    def _history_payload_to_inbound(self, contact: OneBotContact, payload: dict[str, Any]) -> OneBotInboundMessage | None:
+        text = self._history_payload_text(payload)
+        if not text:
+            return None
+        if contact.kind == "group":
+            target = OneBotTarget(message_type="group", group_id=contact.target_id)
+            session_id = f"onebot_group_{contact.target_id}"
+        else:
+            target = OneBotTarget(message_type="private", user_id=contact.target_id)
+            session_id = f"onebot_private_{contact.target_id}"
+        metadata = {
+            "platform": "onebot_v11",
+            "raw_payload": payload,
+            "startup_history_sync": True,
+            "platform_message_id": self._history_message_id(payload),
+            "message_seq": self._history_message_seq(payload),
+            "addressed_to_assistant": False,
+        }
+        return OneBotInboundMessage(
+            session_id=session_id,
+            text=text,
+            sender_id=self._history_sender_id(payload) or str(contact.target_id),
+            mode="auto",
+            scope_root=None,
+            target=target,
+            metadata=metadata,
+        )
+
+    @staticmethod
+    def _history_sender_id(payload: dict[str, Any]) -> str | None:
+        for key in ("sender_id", "user_id", "from_uin"):
+            value = payload.get(key)
+            if isinstance(value, (str, int)) and str(value).strip():
+                return str(value).strip()
+        sender = payload.get("sender")
+        if isinstance(sender, dict):
+            for key in ("user_id", "uin", "qq"):
+                value = sender.get(key)
+                if isinstance(value, (str, int)) and str(value).strip():
+                    return str(value).strip()
+        return None
+
+    @staticmethod
+    def _history_message_id(payload: dict[str, Any]) -> str | None:
+        for key in ("message_id", "id"):
+            value = payload.get(key)
+            if isinstance(value, (str, int)) and str(value).strip():
+                return str(value).strip()
+        return None
+
+    @staticmethod
+    def _history_message_seq(payload: dict[str, Any]) -> str | None:
+        for key in ("message_seq", "seq", "messageSeq"):
+            value = payload.get(key)
+            if isinstance(value, (str, int)) and str(value).strip():
+                return str(value).strip()
+        return None
+
+    def _history_payload_text(self, payload: dict[str, Any]) -> str:
+        message = payload.get("message")
+        if isinstance(message, list):
+            parts = []
+            for item in message:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    data = item.get("data")
+                    if isinstance(data, dict) and isinstance(data.get("text"), str):
+                        parts.append(data["text"].strip())
+            return "".join(parts).strip()
+        for key in ("message", "raw_message", "text"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return re.sub(r"\[CQ:[^\]]+\]", "", value).strip()
+        return ""
+
+    def _history_message_already_recorded(self, inbound: OneBotInboundMessage) -> bool:
+        store = getattr(self, "_history_store", None)
+        if store is None or not hasattr(store, "has_platform_message"):
+            return False
+        metadata = inbound.metadata if isinstance(inbound.metadata, dict) else {}
+        platform_message_id = metadata.get("platform_message_id")
+        return bool(platform_message_id and store.has_platform_message(platform_message_id))
+
+    def _append_to_group_passive_buffer(self, inbound: OneBotInboundMessage) -> None:
+        buffer = self._group_passive_buffers.setdefault(inbound.session_id, [])
+        buffer.append(inbound)
+        max_buffer = max(self._group_context_limit(), self._group_passive_batch_size() * 2)
+        if len(buffer) > max_buffer:
+            del buffer[:-max_buffer]
+
     async def _call_action(
         self,
         websocket,
@@ -291,11 +655,45 @@ class QQBotGatewayClient:
         finally:
             self._action_waiters.pop(echo, None)
 
+    async def _call_action_direct(
+        self,
+        websocket,
+        *,
+        action: str,
+        params: dict[str, Any] | None = None,
+        timeout_seconds: float = 10.0,
+    ) -> dict[str, Any]:
+        echo = f"call_{uuid4().hex[:12]}"
+        request_payload = {"action": action, "params": params or {}, "echo": echo}
+        async with self._send_lock:
+            await websocket.send(json.dumps(request_payload, ensure_ascii=False))
+
+        deadline = time.monotonic() + max(1.0, float(timeout_seconds or 10.0))
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"OneBot action timed out before receive loop: {action}")
+            raw = await asyncio.wait_for(websocket.recv(), timeout=remaining)
+            payload = self._parse_payload(raw)
+            if payload is None:
+                continue
+            if is_auth_failure(payload):
+                raise RuntimeError("OneBot token verification failed. Please check onebot.access_token in config.yaml.")
+            if payload.get("echo") == echo:
+                return payload
+
+    def _is_typing(self, session_id: str) -> bool:
+        """检查对方是否正在输入."""
+        active_map = getattr(self, "_session_typing_active", {})
+        return active_map.get(session_id, False) if isinstance(active_map, dict) else False
+
     async def _handle_typing_notice(self, notice: dict[str, Any]) -> None:
+        session_id = str(notice.get("session_id") or "").strip()
+        if session_id:
+            self._session_typing_active[session_id] = bool(notice.get("active"))
         chat_service = getattr(getattr(self, "app", None), "chat_service", None)
         if chat_service is None or not hasattr(chat_service, "capture_live_typing"):
             return
-        session_id = str(notice.get("session_id") or "").strip()
         if not session_id:
             return
         metadata = {
@@ -326,104 +724,166 @@ class QQBotGatewayClient:
         )
 
     async def _handle_inbound(self, websocket, inbound: OneBotInboundMessage) -> None:
+        # 私聊收集：等 typing 停了 + 10 秒收口，期间所有消息排队合并
+        if inbound.target.message_type == "private" and hasattr(self, "_session_locks"):
+            sid = inbound.session_id
+            lock = self._session_locks.setdefault(sid, asyncio.Lock())
+            async with lock:
+                if self._session_processing.get(sid, False):
+                    self._session_pending.setdefault(sid, []).append(inbound)
+                    return
+                self._session_processing[sid] = True
+            try:
+                queue: list[OneBotInboundMessage] = [inbound]
+                deadline = time.time() + 60.0  # 最多等 60 秒
+                typing_was_active = False
+                await asyncio.sleep(1.0)  # 等 typing notice
+                while time.time() < deadline:
+                    is_typing = getattr(self, "_is_typing", lambda _: False)(sid)
+                    if is_typing:
+                        typing_was_active = True
+                        await asyncio.sleep(0.5)
+                        continue
+                    if typing_was_active:
+                        # typing 停了 → 10 秒收口
+                        quiet_end = time.time() + 10.0
+                        while time.time() < quiet_end:
+                            if getattr(self, "_is_typing", lambda _: False)(sid):
+                                typing_was_active = True
+                                break
+                            async with lock:
+                                extra = self._session_pending.pop(sid, [])
+                            queue.extend(extra)
+                            if extra:
+                                break
+                            await asyncio.sleep(0.5)
+                        if not getattr(self, "_is_typing", lambda _: False)(sid):
+                            break
+                    else:
+                        # 没出现过 typing，等 2 秒直接 dispatch
+                        await asyncio.sleep(2.0)
+                        async with lock:
+                            extra = self._session_pending.pop(sid, [])
+                        queue.extend(extra)
+                        break
+                # 合并所有收集到的消息
+                async with lock:
+                    leftover = self._session_pending.pop(sid, [])
+                queue.extend(leftover)
+                # 取队列第一条做基，合并所有文本
+                merged = queue[0]
+                extra_texts = [await asyncio.to_thread(self._resolve_inbound, q) for q in queue[1:]]
+                extra_texts = [t.text for t in extra_texts if t is not None and t.text.strip()]
+                if extra_texts:
+                    merged = replace(merged, text=merged.text + "\n" + "\n".join(extra_texts))
+                inbound = merged
+            finally:
+                async with lock:
+                    self._session_processing[sid] = False
+
         try:
             resolved_inbound = await asyncio.to_thread(self._resolve_inbound, inbound)
             if resolved_inbound is None:
                 return
+            if (
+                resolved_inbound.target.message_type == "group"
+                and self._is_group_message_addressed(resolved_inbound)
+            ):
+                await self._sync_group_history_for_inbound(websocket, resolved_inbound)
             self._remember_recent_message(
                 resolved_inbound.session_id,
                 role="user",
                 text=resolved_inbound.text,
                 sender_id=resolved_inbound.sender_id,
+                sender_name=self._sender_name_from_inbound(resolved_inbound),
                 image_attachments=resolved_inbound.image_attachments,
             )
-            self._record_inbound_history(resolved_inbound)
             self._sync_proxy_reply_context(resolved_inbound)
 
-            if await self._maybe_handle_proxy_send(websocket, resolved_inbound):
-                return
+            is_private = resolved_inbound.target.message_type == "private"
+            is_group = not is_private
 
-            merged_inbound = await self._coalesce_inbound(websocket, resolved_inbound)
-            if merged_inbound is None:
-                return
+            if is_group:
+                group_inbound = self._prepare_group_inbound_for_dispatch(resolved_inbound)
+                if group_inbound is None:
+                    return
+                resolved_inbound = group_inbound
 
-            loop = asyncio.get_running_loop()
-            progress_controller = _QQProgressUpdateController(
-                self,
-                websocket=websocket,
-                target=merged_inbound.target,
-                session_id=merged_inbound.session_id,
-                user_text=merged_inbound.text,
-                loop=loop,
-            )
-            progress_task = asyncio.create_task(progress_controller.run())
-            try:
-                turn_payload = merged_inbound.metadata.get("finalized_turn") if isinstance(merged_inbound.metadata, dict) else None
-                self._append_live_turn_trace(
-                    merged_inbound.session_id,
-                    "qq_dispatch_start",
-                    {
-                        "session_id": merged_inbound.session_id,
-                        "text": merged_inbound.text,
-                        "mode": merged_inbound.mode,
-                        "turn_id": (
-                            str(turn_payload.get("turn_id") or "").strip()
-                            if isinstance(turn_payload, dict)
-                            else None
-                        ),
-                        "has_finalized_turn": isinstance(turn_payload, dict),
-                    },
-                )
-                reply = await asyncio.to_thread(
-                    self._dispatch_message,
-                    merged_inbound,
-                    progress_controller.callback,
-                )
-                self._append_live_turn_trace(
-                    merged_inbound.session_id,
-                    "qq_dispatch_done",
-                    {
-                        "session_id": merged_inbound.session_id,
-                        "text": merged_inbound.text,
-                        "mode": getattr(reply, "mode", ""),
-                        "used_agent": bool(getattr(reply, "used_agent", False)),
-                        "has_response": bool(str(getattr(reply, "response", "")).strip()),
-                        "trace_id": (
-                            str(((getattr(reply, "metadata", None) or {}).get("trace_id") or "")).strip()
-                            if isinstance(getattr(reply, "metadata", None), dict)
-                            else ""
-                        ),
-                    },
-                )
-            finally:
-                progress_controller.finish()
-                progress_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await progress_task
-            if not self.onebot_cfg.send_replies or not reply.response.strip():
-                return
+            # 群聊指定回复：@ 或提到名字 → 同步消息 + 附上近期上下文
+            if is_group:
+                await self._sync_group_history_for_inbound(websocket, resolved_inbound)
+                context_messages = self._group_context_messages(resolved_inbound.session_id, limit=self._group_context_limit())
+                if context_messages:
+                    resolved_inbound = replace(
+                        resolved_inbound,
+                        text=self._build_group_context_review_text(context_messages),
+                        metadata={
+                            **resolved_inbound.metadata,
+                            "group_context_review": True,
+                            "group_reply_policy": "required",
+                            "group_dispatch_trigger": "\u6307\u5b9a\u56de\u590d",
+                            "group_context_messages": context_messages,
+                        },
+                    )
 
-            await self._send_generated_reply(websocket, merged_inbound, reply)
+            sid = resolved_inbound.session_id
+
+            # 私聊已在收集阶段处理完合并和等待，直接进 dispatch
+            # 群聊走 coalesce + live_turn buffer
+            if is_private:
+                merged_inbound = resolved_inbound
+                await self._dispatch_and_reply(websocket, merged_inbound)
+                return
+            else:
+                lock = getattr(self, "_session_lock", None)
+                processing = getattr(self, "_session_processing", {})
+                pending_map = getattr(self, "_session_pending", {})
+                if lock is not None:
+                    async with lock:
+                        if processing.get(sid, False):
+                            pending_map.setdefault(sid, []).append(resolved_inbound)
+                            return
+                        processing[sid] = True
+                        asyncio.create_task(self._handle_inbound(websocket, combined))
         except Exception as exc:  # noqa: BLE001
             print(f"[onebot] inbound handling failed: {exc}")
-            self._append_live_turn_trace(
-                inbound.session_id,
-                "onebot_inbound_error",
-                {
-                    "session_id": inbound.session_id,
-                    "text": inbound.text,
-                    "error": str(exc),
-                },
-            )
             try:
                 await self._send_text_reply(
-                    websocket,
-                    inbound.target,
-                    "这一步在 QQ 通道层卡住了，我已经把错误写进 trace，先别急着重发，我来查。",
-                    session_id=inbound.session_id,
+                    websocket, inbound.target, "稍等，卡了一下，我再试试。", session_id=inbound.session_id,
                 )
             except Exception as send_exc:  # noqa: BLE001
                 print(f"[onebot] failed to send fallback reply: {send_exc}")
+
+    async def _dispatch_and_reply(self, websocket, inbound: OneBotInboundMessage) -> None:
+        """私聊直接 dispatch + reply 的快捷路径，跳过 coalesce / live_turn."""
+        loop = asyncio.get_running_loop()
+        progress_controller = _QQProgressUpdateController(
+            self, websocket=websocket, target=inbound.target,
+            session_id=inbound.session_id, user_text=inbound.text, loop=loop,
+        )
+        progress_task = asyncio.create_task(progress_controller.run())
+        reply = None
+        try:
+            self._append_live_turn_trace(
+                inbound.session_id, "qq_dispatch_start",
+                {"session_id": inbound.session_id, "text": inbound.text, "mode": inbound.mode},
+            )
+            reply = await asyncio.to_thread(self._dispatch_message, inbound, progress_controller.callback)
+            self._append_live_turn_trace(
+                inbound.session_id, "qq_dispatch_done",
+                {"session_id": inbound.session_id, "text": inbound.text,
+                 "mode": getattr(reply, "mode", ""), "used_agent": bool(getattr(reply, "used_agent", False)),
+                 "has_response": bool(str(getattr(reply, "response", "")).strip()),
+                 "trace_id": str(((getattr(reply, "metadata", None) or {}).get("trace_id") or "")).strip()
+                 if isinstance(getattr(reply, "metadata", None), dict) else ""},
+            )
+        finally:
+            progress_controller.finish()
+            progress_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await progress_task
+        if reply is not None and self.onebot_cfg.send_replies and reply.response.strip():
+            await self._send_generated_reply(websocket, inbound, reply)
 
     def _dispatch_message(
             self,
@@ -431,6 +891,12 @@ class QQBotGatewayClient:
             progress_callback=None,
     ):
         channel_runtime = self._build_channel_runtime(inbound)
+        access_policy = build_onebot_access_policy(
+            inbound.sender_id,
+            self.onebot_cfg.full_access_user_ids,
+            self.onebot_cfg.owner_user_ids,
+            self.onebot_cfg.owner_display_name,
+        )
         return self.app.channel_router.dispatch(
             ChannelMessage(
                 channel="onebot_v11",
@@ -443,13 +909,27 @@ class QQBotGatewayClient:
                     "channel": {
                         "name": "onebot_v11",
                     },
+                    "access_policy": access_policy,
                 },
                 progress_callback=progress_callback,
                 sender={"user_id": inbound.sender_id},
                 metadata=inbound.metadata,
             )
         )
+
     async def _send_generated_reply(self, websocket, inbound: OneBotInboundMessage, reply) -> None:
+        if self._should_suppress_no_reply_output(inbound, getattr(reply, "response", "")):
+            self._append_live_turn_trace(
+                inbound.session_id,
+                "group_context_review_no_reply",
+                {
+                    "session_id": inbound.session_id,
+                    "reason": "llm_decided_no_reply",
+                    "text": inbound.text,
+                },
+            )
+            return
+        reply = self._sanitize_reply_for_qq(reply)
         delivery_paths = extract_delivery_file_paths(reply)
         voice_task = self._start_voice_reply_task(reply, delivery_paths=delivery_paths)
 
@@ -477,6 +957,170 @@ class QQBotGatewayClient:
             delivery_paths=delivery_paths,
             voice_result=voice_result,
         )
+        self._schedule_reply_sticker(websocket, inbound, reply.response)
+
+    @staticmethod
+    def _should_suppress_no_reply_output(inbound: OneBotInboundMessage, response_text: str) -> bool:
+        metadata = inbound.metadata if isinstance(inbound.metadata, dict) else {}
+        if str(metadata.get("group_reply_policy") or "").strip() != "optional":
+            return False
+        return str(response_text or "").strip() == "__NO_REPLY__"
+
+    @staticmethod
+    def _normalize_recent_group_text(text: Any) -> str:
+        return re.sub(r"\s+", " ", str(text or "")).strip()
+
+    def _schedule_reply_sticker(self, websocket, inbound: OneBotInboundMessage, reply_text: str) -> None:
+        task = asyncio.create_task(self._maybe_send_reply_sticker(websocket, inbound, reply_text))
+
+        def consume_result(done_task: asyncio.Task) -> None:
+            with contextlib.suppress(asyncio.CancelledError):
+                exc = done_task.exception()
+                if exc is not None:
+                    print(f"[onebot] sticker send skipped: {exc}")
+
+        task.add_done_callback(consume_result)
+
+    def _sanitize_reply_for_qq(self, reply):
+        response = self._strip_performance_text(getattr(reply, "response", "") or "")
+        speech_text = self._strip_performance_text(getattr(reply, "speech_text", "") or response)
+        if response == getattr(reply, "response", "") and speech_text == getattr(reply, "speech_text", ""):
+            return reply
+        if hasattr(reply, "model_copy"):
+            return reply.model_copy(update={"response": response, "speech_text": speech_text})
+        try:
+            return replace(reply, response=response, speech_text=speech_text)
+        except Exception:  # noqa: BLE001
+            setattr(reply, "response", response)
+            setattr(reply, "speech_text", speech_text)
+            return reply
+
+    @classmethod
+    def _strip_performance_text(cls, text: str) -> str:
+        normalized = str(text or "").strip()
+        if not normalized:
+            return ""
+
+        def replace_line(match: re.Match[str]) -> str:
+            inner = (match.group(1) or match.group(2) or "").strip()
+            return "" if cls._is_stage_direction_text(inner) else match.group(0)
+
+        normalized = cls._STAGE_DIRECTION_LINE_PATTERN.sub(replace_line, normalized)
+        normalized = cls._strip_leading_stage_directions(normalized)
+        while True:
+            match = cls._TRAILING_STAGE_DIRECTION_PATTERN.search(normalized)
+            if not match:
+                break
+            groups = [group for group in match.groups() if group]
+            if not groups or not all(cls._is_stage_direction_text(group.strip()) for group in groups):
+                break
+            normalized = normalized[: match.start()].rstrip()
+        normalized = re.sub(r"\n{3,}", "\n\n", normalized).strip()
+        return normalized
+
+    @classmethod
+    def _strip_leading_stage_directions(cls, text: str) -> str:
+        normalized = str(text or "").lstrip()
+        pattern = re.compile(r"^\s*[\(（【\[]([^()\[\]（）【】\n]{1,24})[\)）】\]]\s*")
+        while True:
+            match = pattern.match(normalized)
+            if match is None:
+                return normalized.strip()
+            inner = match.group(1).strip()
+            if not cls._is_stage_direction_text(inner):
+                return normalized.strip()
+            normalized = normalized[match.end():].lstrip()
+
+    @staticmethod
+    def _is_stage_direction_text(text: str) -> bool:
+        normalized = str(text or "").strip().lower()
+        if not normalized or len(normalized) > 24:
+            return False
+        if re.search(r"\d|https?://|[\\/]|[。？！!?；;：:，,、]", normalized):
+            return False
+        action_tokens = (
+            "笑",
+            "摸",
+            "歪头",
+            "点头",
+            "摇头",
+            "眨眼",
+            "叹气",
+            "思考",
+            "挠头",
+            "摊手",
+            "认真",
+            "小声",
+            "偷看",
+            "举手",
+            "低头",
+            "伸",
+            "伸个懒腰",
+            "懒腰",
+            "抱",
+            "喝茶",
+            "开心",
+            "害怕",
+            "流汗",
+            "无语",
+            "卖萌",
+            "工作中",
+            "银狼",
+            "smile",
+            "smiles",
+            "laugh",
+            "laughs",
+            "nod",
+            "nods",
+            "sigh",
+            "sighs",
+            "thinking",
+            "wink",
+            "shrug",
+        )
+        return any(token in normalized for token in action_tokens)
+
+    async def _maybe_send_reply_sticker(self, websocket, inbound: OneBotInboundMessage, reply_text: str) -> None:
+        try:
+            session_id = str(inbound.session_id or "").strip()
+            if not session_id or not self._can_send_sticker(session_id):
+                return
+            stickers = self._available_sticker_paths()
+            if not stickers:
+                return
+            chooser = getattr(self._llm_client, "choose_qq_sticker", None)
+            if chooser is None:
+                return
+            names = [path.stem for path in stickers]
+            try:
+                decision = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        chooser,
+                        user_text=inbound.text,
+                        assistant_reply=reply_text,
+                        recent_messages=self.get_recent_messages(session_id=session_id, limit=10, include_assistant=True),
+                        available_stickers=names,
+                        sticker_count_last_10=self._sticker_count_in_recent(session_id),
+                        max_stickers_per_10=3,
+                    ),
+                    timeout=4.0,
+                )
+            except Exception:  # noqa: BLE001
+                return
+            if not isinstance(decision, dict) or not bool(decision.get("send")):
+                return
+            sticker_path = self._resolve_sticker_choice(str(decision.get("sticker_name") or ""), stickers)
+            if sticker_path is None or not self._can_send_sticker(session_id):
+                return
+            await self._send_sticker_async(
+                websocket,
+                inbound.target,
+                sticker_path=sticker_path,
+                sticker_name=sticker_path.stem,
+                session_id=session_id,
+            )
+        except Exception:  # noqa: BLE001
+            return
 
     def _start_voice_reply_task(self, reply, *, delivery_paths: list[str]) -> asyncio.Task | None:
         if delivery_paths:
@@ -547,6 +1191,49 @@ class QQBotGatewayClient:
         if not include_assistant:
             messages = [item for item in messages if item.get("role") != "assistant"]
         return messages[-normalized_limit:]
+
+    @staticmethod
+    def _available_sticker_paths() -> list[Path]:
+        sticker_dir = Path("data/stickers")
+        if not sticker_dir.is_dir():
+            return []
+        image_exts = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
+        return [
+            path.resolve()
+            for path in sorted(sticker_dir.iterdir())
+            if path.is_file() and path.suffix.lower() in image_exts
+        ]
+
+    @staticmethod
+    def _resolve_sticker_choice(sticker_name: str, stickers: list[Path]) -> Path | None:
+        normalized = str(sticker_name or "").strip()
+        if not normalized:
+            return None
+        direct = Path(normalized).expanduser()
+        if direct.is_file():
+            return direct.resolve()
+        for path in stickers:
+            if path.stem == normalized or path.name == normalized:
+                return path
+        normalized_lower = normalized.casefold()
+        for path in stickers:
+            if path.stem.casefold() == normalized_lower or path.name.casefold() == normalized_lower:
+                return path
+        return None
+
+    def _sticker_count_in_recent(self, session_id: str | None, *, window_messages: int = 10) -> int:
+        normalized_session_id = str(session_id or "").strip()
+        if not normalized_session_id:
+            return 0
+        recent = self.get_recent_messages(
+            session_id=normalized_session_id,
+            limit=max(1, window_messages),
+            include_assistant=True,
+        )
+        return sum(1 for item in recent if item.get("sticker_name"))
+
+    def _can_send_sticker(self, session_id: str | None, *, window_messages: int = 10, max_stickers: int = 3) -> bool:
+        return self._sticker_count_in_recent(session_id, window_messages=window_messages) < max_stickers
 
     def get_last_reply(
         self,
@@ -672,6 +1359,293 @@ class QQBotGatewayClient:
 
         return self._run_coroutine_sync(_send(), timeout_seconds=15.0)
 
+    def get_group_members(
+        self,
+        *,
+        group_id: int,
+    ) -> list[dict[str, Any]]:
+        _, websocket = self._require_active_connection()
+
+        async def _run() -> list[dict[str, Any]]:
+            result = await self._call_action(
+                websocket,
+                action="get_group_member_list",
+                params={"group_id": group_id},
+            )
+            self._ensure_action_success(result, action_name="get_group_member_list")
+            data = result.get("data")
+            members: list[dict[str, Any]] = []
+            if isinstance(data, list):
+                for item in data:
+                    if isinstance(item, dict):
+                        role = str(item.get("role", "member") or "member").strip().lower()
+                        members.append({
+                            "user_id": item.get("user_id"),
+                            "nickname": item.get("nickname") or item.get("card") or "",
+                            "card": item.get("card", ""),
+                            "role": role,
+                            "last_sent_time": item.get("last_sent_time", 0),
+                        })
+            return members
+
+        return self._run_coroutine_sync(_run(), timeout_seconds=20.0)
+
+    def get_group_member_info(
+        self,
+        *,
+        group_id: int,
+        user_id: int,
+    ) -> dict[str, Any] | None:
+        _, websocket = self._require_active_connection()
+
+        async def _run() -> dict[str, Any] | None:
+            result = await self._call_action(
+                websocket,
+                action="get_group_member_info",
+                params={"group_id": group_id, "user_id": user_id},
+            )
+            self._ensure_action_success(result, action_name="get_group_member_info")
+            data = result.get("data")
+            if isinstance(data, dict):
+                return {
+                    "user_id": data.get("user_id"),
+                    "nickname": data.get("nickname") or data.get("card") or "",
+                    "card": data.get("card", ""),
+                    "role": data.get("role", "member"),
+                    "title": data.get("title", ""),
+                    "age": data.get("age"),
+                    "sex": data.get("sex"),
+                    "join_time": data.get("join_time"),
+                    "last_sent_time": data.get("last_sent_time"),
+                }
+            return None
+
+        return self._run_coroutine_sync(_run(), timeout_seconds=15.0)
+
+    def set_group_ban(
+        self,
+        *,
+        group_id: int,
+        user_id: int,
+        duration_seconds: int = 0,
+    ) -> dict[str, Any]:
+        """duration_seconds=0 means unban."""
+        _, websocket = self._require_active_connection()
+
+        async def _run() -> dict[str, Any]:
+            result = await self._call_action(
+                websocket,
+                action="set_group_ban",
+                params={
+                    "group_id": group_id,
+                    "user_id": user_id,
+                    "duration": max(0, duration_seconds),
+                },
+            )
+            self._ensure_action_success(result, action_name="set_group_ban")
+            return {
+                "banned": True,
+                "user_id": user_id,
+                "group_id": group_id,
+                "duration_seconds": max(0, duration_seconds),
+            }
+
+        return self._run_coroutine_sync(_run(), timeout_seconds=10.0)
+
+    def set_group_card(
+        self,
+        *,
+        group_id: int,
+        user_id: int,
+        card: str,
+    ) -> dict[str, Any]:
+        _, websocket = self._require_active_connection()
+
+        async def _run() -> dict[str, Any]:
+            result = await self._call_action(
+                websocket,
+                action="set_group_card",
+                params={"group_id": group_id, "user_id": user_id, "card": card},
+            )
+            self._ensure_action_success(result, action_name="set_group_card")
+            return {"card_set": True, "user_id": user_id, "group_id": group_id, "card": card}
+
+        return self._run_coroutine_sync(_run(), timeout_seconds=10.0)
+
+    def get_group_info(
+        self,
+        *,
+        group_id: int,
+    ) -> dict[str, Any] | None:
+        _, websocket = self._require_active_connection()
+
+        async def _run() -> dict[str, Any] | None:
+            result = await self._call_action(
+                websocket,
+                action="get_group_info",
+                params={"group_id": group_id},
+            )
+            self._ensure_action_success(result, action_name="get_group_info")
+            data = result.get("data")
+            if isinstance(data, dict):
+                return {
+                    "group_id": group_id,
+                    "name": data.get("group_name") or data.get("name", ""),
+                    "member_count": data.get("member_count", 0),
+                    "max_member_count": data.get("max_member_count", 0),
+                }
+            return None
+
+        return self._run_coroutine_sync(_run(), timeout_seconds=10.0)
+
+    def poke(
+        self,
+        *,
+        user_id: int,
+        group_id: int | None = None,
+    ) -> dict[str, Any]:
+        """戳一戳指定用户（群聊时需传 group_id）。"""
+        _, websocket = self._require_active_connection()
+
+        async def _run() -> dict[str, Any]:
+            params: dict[str, Any] = {"user_id": user_id}
+            if group_id is not None:
+                params["group_id"] = group_id
+            # 尝试 send_group_sign (仅群) 或 send_like + poke
+            try:
+                result = await self._call_action(
+                    websocket,
+                    action="send_group_sign",
+                    params=params,
+                )
+            except RuntimeError:
+                return {"ok": False, "error": "poke unavailable (group_id may be required)"}
+            self._ensure_action_success(result, action_name="poke")
+            return {"ok": True, "user_id": user_id, "group_id": group_id}
+
+        return self._run_coroutine_sync(_run(), timeout_seconds=10.0)
+
+    def send_like(
+        self,
+        *,
+        user_id: int,
+        times: int = 1,
+    ) -> dict[str, Any]:
+        """给指定用户点赞（最多 10 次）。"""
+        _, websocket = self._require_active_connection()
+
+        async def _run() -> dict[str, Any]:
+            result = await self._call_action(
+                websocket,
+                action="send_like",
+                params={"user_id": user_id, "times": min(10, max(1, times))},
+            )
+            self._ensure_action_success(result, action_name="send_like")
+            return {"ok": True, "user_id": user_id, "times": times}
+
+        return self._run_coroutine_sync(_run(), timeout_seconds=10.0)
+
+    def send_image(
+        self,
+        *,
+        image_path: str,
+        target_kind: str = "current",
+        target_id: int | None = None,
+        current_target: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        target = self._resolve_runtime_target(target_kind, target_id, current_target)
+        _, websocket = self._require_active_connection()
+
+        async def _send() -> dict[str, Any]:
+            action = build_image_action(target, image_path)
+            result = await self._call_action(
+                websocket,
+                action=action["action"],
+                params=action["params"],
+            )
+            self._ensure_action_success(result, action_name="qq.send_image")
+            self._record_outbound_history(
+                session_id=self._session_id_for_target(target),
+                target=target,
+                text="",
+                message_type="image",
+                attachments=[{"kind": "image", "local_path": image_path}],
+            )
+            return {"sent": True, "path": image_path, "target": self._serialize_target(target)}
+
+        return self._run_coroutine_sync(_send(), timeout_seconds=20.0)
+
+    def send_sticker(
+        self,
+        *,
+        sticker_name: str,
+        image_path: str | None = None,
+        current_target: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        target = self._resolve_runtime_target("current", None, current_target)
+        session_id = self._session_id_for_target(target)
+        if not self._can_send_sticker(session_id):
+            return {
+                "sent": False,
+                "skipped": True,
+                "reason": "sticker_frequency_limited",
+                "sticker_name": sticker_name,
+            }
+        sticker_path = Path(image_path).expanduser().resolve() if image_path else self._resolve_sticker_choice(sticker_name, self._available_sticker_paths())
+        if sticker_path is None or not sticker_path.is_file():
+            raise FileNotFoundError(f"Sticker does not exist: {sticker_name}")
+        _, websocket = self._require_active_connection()
+        return self._run_coroutine_sync(
+            self._send_sticker_async(
+                websocket,
+                target,
+                sticker_path=sticker_path,
+                sticker_name=sticker_path.stem,
+                session_id=session_id,
+            ),
+            timeout_seconds=20.0,
+        )
+
+    async def _send_sticker_async(
+        self,
+        websocket,
+        target: OneBotTarget,
+        *,
+        sticker_path: Path,
+        sticker_name: str,
+        session_id: str | None,
+    ) -> dict[str, Any]:
+        action = build_image_action(target, str(sticker_path))
+        result = await self._call_action(
+            websocket,
+            action=action["action"],
+            params=action["params"],
+        )
+        self._ensure_action_success(result, action_name="qq.send_sticker")
+        normalized_session_id = str(session_id or "").strip()
+        if normalized_session_id:
+            self._remember_recent_message(
+                normalized_session_id,
+                role="assistant",
+                text=f"[sticker:{sticker_name}]",
+                sticker_name=sticker_name,
+            )
+        self._record_outbound_history(
+            session_id=normalized_session_id,
+            target=target,
+            text=f"[sticker:{sticker_name}]",
+            message_type="sticker",
+            attachments=[{"kind": "image", "local_path": str(sticker_path), "is_sticker": True, "name": sticker_name}],
+        )
+        return {
+            "sent": True,
+            "sticker_name": sticker_name,
+            "path": str(sticker_path),
+            "message_id": self._extract_message_id(result),
+            "target": self._serialize_target(target),
+            "result": result,
+        }
+
     def send_file(
         self,
         file_path: str,
@@ -758,13 +1732,14 @@ class QQBotGatewayClient:
                 self._schedule_cleanup(cleanup_path)
 
     def _build_channel_runtime(self, inbound: OneBotInboundMessage) -> dict[str, Any]:
-        raw_payload = inbound.metadata.get("raw_payload") if isinstance(inbound.metadata, dict) else None
+        inbound_metadata = inbound.metadata if isinstance(inbound.metadata, dict) else {}
+        raw_payload = inbound_metadata.get("raw_payload")
         sender_name = ""
         if isinstance(raw_payload, dict):
             sender = raw_payload.get("sender")
             if isinstance(sender, dict):
                 sender_name = str(sender.get("card") or sender.get("nickname") or "").strip()
-        finalized_turn = inbound.metadata.get("finalized_turn") if isinstance(inbound.metadata, dict) else None
+        finalized_turn = inbound_metadata.get("finalized_turn")
         finalized_segments = []
         if isinstance(finalized_turn, dict):
             finalized_segments = [
@@ -795,7 +1770,181 @@ class QQBotGatewayClient:
             "current_target": self._serialize_target(inbound.target),
             "finalized_turn_segments": finalized_segments,
             "recent_user_messages": recent_user_messages,
+            "group_context_messages": self._group_context_messages(inbound.session_id, limit=12),
+            "group_dispatch_trigger": str(inbound_metadata.get("group_dispatch_trigger") or "").strip(),
+            "group_context_review": bool(inbound_metadata.get("group_context_review")),
+            "group_reply_policy": str(inbound_metadata.get("group_reply_policy") or "").strip(),
         }
+
+    def _prepare_group_inbound_for_dispatch(self, inbound: OneBotInboundMessage) -> OneBotInboundMessage | None:
+        if inbound.target.message_type != "group":
+            return inbound
+
+        session_id = inbound.session_id
+        addressed = self._is_group_message_addressed(inbound)
+        buffer = self._group_passive_buffers.setdefault(session_id, [])
+
+        if addressed:
+            self._group_followup_until[session_id] = time.monotonic() + self._group_followup_window_seconds()
+            context = list(buffer[-self._group_context_limit():])
+            context_records = self._group_context_messages(session_id, limit=self._group_context_limit())
+            buffer.clear()
+            return self._with_group_context_metadata(
+                inbound,
+                trigger="specified_reply",
+                context_messages=context,
+                context_records=context_records,
+            )
+
+        buffer.append(inbound)
+        max_buffer = max(self._group_context_limit(), self._group_passive_batch_size() * 2)
+        if len(buffer) > max_buffer:
+            del buffer[:-max_buffer]
+        self._append_live_turn_trace(
+            session_id,
+            "group_message_synced",
+            {
+                "session_id": session_id,
+                "sender_id": inbound.sender_id,
+                "text": inbound.text,
+                "buffer_count": len(buffer),
+                "trigger": "sync_only",
+            },
+        )
+        return None
+
+    def _is_group_message_addressed(self, inbound: OneBotInboundMessage) -> bool:
+        if inbound.target.message_type != "group":
+            return False
+        metadata = inbound.metadata if isinstance(inbound.metadata, dict) else {}
+        return bool(metadata.get("addressed_to_assistant") or metadata.get("mentioned_self"))
+
+    def _should_dispatch_passive_group_batch(self, session_id: str, *, now: float) -> bool:
+        buffer = self._group_passive_buffers.get(session_id, [])
+        if len(buffer) < self._group_passive_batch_size():
+            return False
+        last_at = self._group_last_passive_dispatch_at.get(session_id, 0.0)
+        return now - last_at >= self._group_passive_min_interval_seconds()
+
+    def _merge_group_context_as_passive_inbound(self, batch: list[OneBotInboundMessage]) -> OneBotInboundMessage:
+        latest = batch[-1]
+        lines = [
+            "这是群聊里刚刚发生的一小段对话。请像群友一样结合上下文自然插一句；如果不值得回应，就简短带过，不要逐条总结。"
+        ]
+        for item in batch:
+            label = self._sender_label_for_inbound(item)
+            text = item.text.strip()
+            if text:
+                lines.append(f"{label}: {text}")
+        metadata = dict(latest.metadata)
+        metadata["group_passive_batch"] = True
+        metadata["coalesced_messages"] = [item.text for item in batch if item.text.strip()]
+        metadata["coalesced_count"] = len(batch)
+        return replace(latest, text="\n".join(lines).strip(), mode="chat", metadata=metadata)
+
+    def _with_group_context_metadata(
+        self,
+        inbound: OneBotInboundMessage,
+        *,
+        trigger: str,
+        context_messages: list[OneBotInboundMessage],
+        context_records: list[dict[str, Any]] | None = None,
+    ) -> OneBotInboundMessage:
+        metadata = dict(inbound.metadata)
+        metadata["group_dispatch_trigger"] = trigger
+        serialized = [
+            self._serialize_group_context_message(item)
+            for item in context_messages
+            if item.text.strip()
+        ]
+        for item in context_records or []:
+            if not isinstance(item, dict):
+                continue
+            text = str(item.get("text") or "").strip()
+            if not text:
+                continue
+            serialized.append(
+                {
+                    "role": str(item.get("role") or "").strip(),
+                    "text": text,
+                    "sender_id": str(item.get("sender_id") or "").strip(),
+                    "sender_name": str(item.get("sender_name") or "").strip(),
+                    "created_at": str(item.get("created_at") or "").strip(),
+                }
+            )
+        deduped: list[dict[str, Any]] = []
+        seen: set[tuple[str, str, str]] = set()
+        for item in serialized:
+            key = (
+                str(item.get("created_at") or "").strip(),
+                str(item.get("sender_id") or "").strip(),
+                str(item.get("text") or "").strip(),
+            )
+            if not key[2] or key in seen:
+                continue
+            seen.add(key)
+            deduped.append(item)
+        metadata["group_context_messages"] = deduped[-self._group_context_limit():]
+        return replace(inbound, metadata=metadata)
+
+    def _group_context_messages(self, session_id: str, *, limit: int) -> list[dict[str, Any]]:
+        recent = self.get_recent_messages(session_id=session_id, limit=limit, include_assistant=True)
+        messages: list[dict[str, Any]] = []
+        for item in recent:
+            if not isinstance(item, dict):
+                continue
+            text = str(item.get("text") or "").strip()
+            if not text:
+                continue
+            messages.append(
+                {
+                    "role": str(item.get("role") or "").strip(),
+                    "text": text,
+                    "sender_id": str(item.get("sender_id") or "").strip(),
+                    "sender_name": str(item.get("sender_name") or "").strip(),
+                    "created_at": str(item.get("created_at") or "").strip(),
+                }
+            )
+        return messages
+
+    def _serialize_group_context_message(self, inbound: OneBotInboundMessage) -> dict[str, Any]:
+        return {
+            "text": inbound.text,
+            "sender_id": inbound.sender_id,
+            "sender_name": self._sender_label_for_inbound(inbound),
+            "created_at": datetime.now(UTC).isoformat(),
+        }
+
+    def _sender_label_for_inbound(self, inbound: OneBotInboundMessage) -> str:
+        name = self._sender_name_from_inbound(inbound)
+        return name or str(inbound.sender_id or "unknown")
+
+    @staticmethod
+    def _sender_name_from_inbound(inbound: OneBotInboundMessage) -> str:
+        raw_payload = inbound.metadata.get("raw_payload") if isinstance(inbound.metadata, dict) else None
+        if isinstance(raw_payload, dict):
+            sender = raw_payload.get("sender")
+            if isinstance(sender, dict):
+                return str(sender.get("card") or sender.get("nickname") or "").strip()
+        return ""
+
+    def _group_followup_window_seconds(self) -> float:
+        value = getattr(self.onebot_cfg, "group_followup_window_ms", 20000)
+        return max(5.0, float(value or 20000) / 1000.0)
+
+    def _group_context_review_interval_seconds(self) -> float:
+        value = getattr(self.onebot_cfg, "group_context_review_interval_ms", 600000)
+        return max(30.0, float(value or 600000) / 1000.0)
+
+    def _group_passive_min_interval_seconds(self) -> float:
+        value = getattr(self.onebot_cfg, "group_passive_min_interval_ms", 90000)
+        return max(10.0, float(value or 90000) / 1000.0)
+
+    def _group_passive_batch_size(self) -> int:
+        return max(3, int(getattr(self.onebot_cfg, "group_passive_batch_message_count", 5) or 5))
+
+    def _group_context_limit(self) -> int:
+        return max(6, int(getattr(self.onebot_cfg, "group_context_max_messages", 12) or 12))
 
     @classmethod
     def _should_send_live_turn_task_ack(
@@ -863,7 +2012,7 @@ class QQBotGatewayClient:
             prepared = self._prepare_inbound_for_dispatch(inbound)
             if prepared is None:
                 return None
-            return await self._buffer_live_turn_and_maybe_finalize(websocket, prepared)
+            return prepared
 
         session_id = inbound.session_id
         async with self._coalesce_lock:
@@ -885,6 +2034,16 @@ class QQBotGatewayClient:
         if prepared is None:
             return None
         return await self._buffer_live_turn_and_maybe_finalize(websocket, prepared)
+
+    def _merge_inbound_list(self, items: list[OneBotInboundMessage]) -> OneBotInboundMessage | None:
+        """合并多条消息为一条，用于自适应队列模式."""
+        if not items:
+            return None
+        if len(items) == 1:
+            return self._prepare_inbound_for_dispatch(items[0])
+        merged_text = "\n".join(item.text.strip() for item in items if item.text.strip())
+        merged = replace(items[0], text=merged_text)
+        return self._prepare_inbound_for_dispatch(merged)
 
     @staticmethod
     def _merge_inbound_batch(batch: list[OneBotInboundMessage]) -> OneBotInboundMessage:
@@ -1509,7 +2668,9 @@ class QQBotGatewayClient:
         role: str,
         text: str,
         sender_id: str | None = None,
+        sender_name: str | None = None,
         image_attachments: tuple[OneBotImageAttachment, ...] = (),
+        sticker_name: str | None = None,
     ) -> None:
         normalized_session_id = str(session_id).strip()
         normalized_text = str(text).strip()
@@ -1520,10 +2681,14 @@ class QQBotGatewayClient:
             "role": role,
             "text": normalized_text,
             "sender_id": sender_id,
+            "sender_name": str(sender_name or "").strip(),
             "created_at": datetime.now(UTC).isoformat(),
         }
         if serialized_images:
             record["image_attachments"] = serialized_images
+        normalized_sticker_name = str(sticker_name or "").strip()
+        if normalized_sticker_name:
+            record["sticker_name"] = normalized_sticker_name
         limit = max(4, int(getattr(self.onebot_cfg, "recent_message_limit", 24) or 24))
         with self._recent_messages_lock:
             history = self._recent_messages.setdefault(normalized_session_id, [])
@@ -1531,10 +2696,18 @@ class QQBotGatewayClient:
             if len(history) > limit:
                 del history[:-limit]
 
-    def _record_inbound_history(self, inbound: OneBotInboundMessage) -> None:
+    def _record_inbound_history(self, inbound: OneBotInboundMessage, *, metadata_extra: dict[str, Any] | None = None) -> None:
         store = getattr(self, "_history_store", None)
         if store is None:
             return
+        metadata = {"platform": "onebot_v11"}
+        if isinstance(inbound.metadata, dict):
+            for key in ("platform_message_id", "message_id", "message_seq", "startup_history_sync"):
+                value = inbound.metadata.get(key)
+                if value is not None:
+                    metadata[key] = str(value) if key != "startup_history_sync" else bool(value)
+        if isinstance(metadata_extra, dict):
+            metadata.update(metadata_extra)
         store.record_message(
             session_id=inbound.session_id,
             direction="inbound",
@@ -1544,7 +2717,7 @@ class QQBotGatewayClient:
             contact_id=self._contact_id_for_target(inbound.target),
             contact_name=self._contact_name_for_session(inbound.session_id),
             attachments=self._build_inbound_attachments(inbound),
-            metadata={"platform": "onebot_v11"},
+            metadata=metadata,
             created_at=datetime.now(UTC).isoformat(),
         )
 
@@ -2105,15 +3278,16 @@ class QQBotGatewayClient:
                     aliases.append(stripped)
         return tuple(aliases)
 
-    async def _load_contacts(self, websocket) -> tuple[OneBotContact, ...]:
+    async def _load_contacts(self, websocket, *, direct_receive: bool = False) -> tuple[OneBotContact, ...]:
         now = datetime.now().astimezone()
         if self._contact_cache is not None:
             cached_at, contacts = self._contact_cache
             if now - cached_at <= timedelta(minutes=2):
                 return contacts
 
-        friend_result = await self._call_action(websocket, action="get_friend_list", params={})
-        group_result = await self._call_action(websocket, action="get_group_list", params={})
+        call_action = self._call_action_direct if direct_receive else self._call_action
+        friend_result = await call_action(websocket, action="get_friend_list", params={})
+        group_result = await call_action(websocket, action="get_group_list", params={})
         friend_data = friend_result.get("data") if isinstance(friend_result.get("data"), list) else []
         group_data = group_result.get("data") if isinstance(group_result.get("data"), list) else []
         contacts = build_contacts(friend_data, group_data)

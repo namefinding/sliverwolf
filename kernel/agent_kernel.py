@@ -1,35 +1,39 @@
 from __future__ import annotations
 
+import json
 import re
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Callable, Any
 from local_agent.app.scope_resolver import infer_scope_root
 from local_agent.artifacts.output_planner import OutputArtifactPlanner
-from local_agent.intent.models import WorkflowProposal
+from local_agent.intent.models import AnswerabilityAssessment, IntentBundle, TaskEnvelope
 from local_agent.intent.service import IntentService
 from local_agent.kernel.completion_judge import CompletionJudge
 from local_agent.kernel.context_builder import ContextBuilder
 from local_agent.kernel.decision_critic import DecisionCritic
-from local_agent.kernel.decision_validator import DecisionValidator
+from local_agent.kernel.decision_validator import DecisionValidationError, DecisionValidator
 from local_agent.kernel.execution_critic import ExecutionCritic
 from local_agent.kernel.file_retrieval_strategy import FileRetrievalStrategy
 from local_agent.kernel.guardrails import Guardrails
 from local_agent.kernel.loop_controller import LoopController
 from local_agent.kernel.request_intent_analyzer import RequestIntentAnalyzer
 from local_agent.kernel.web_retrieval_strategy import WebRetrievalStrategy
-from local_agent.kernel.workflow_argument_planner import WorkflowArgumentPlanner
-from local_agent.kernel.workflow_selector import WorkflowSelector
 from local_agent.llm.ollama_client import OllamaClient
 from local_agent.memory.warm_memory import WarmMemoryService
 from local_agent.modules.base import ToolRegistry
+from local_agent.modules.system_utility.parser import parse_when_text
+from local_agent.protocol.execution_contract import build_tool_execution_context
 from local_agent.protocol.models import (
     AgentConfig,
     CandidateState,
     DecisionReview,
     DecisionType,
     ExecutionReview,
+    InstructionIntent,
+    MemoryCandidateIntent,
     MemoryRecord,
     Message,
     OutputKind,
@@ -40,6 +44,7 @@ from local_agent.protocol.models import (
     TaskGoal,
     ToolCallResult,
     ToolDecision,
+    ToolUseContext,
     TurnArtifacts,
     WorkflowCandidate,
     WorkflowNodeSpec,
@@ -47,6 +52,7 @@ from local_agent.protocol.models import (
     WorkflowState,
 )
 from local_agent.storage.memory_store import SQLiteMemoryStore
+from local_agent.storage.trace_audit import write_trace_audit_files
 from local_agent.storage.trace_store import JsonlTraceStore
 from local_agent.utils.file_query_normalizer import FileQueryNormalizer
 from local_agent.utils.target_resolver import resolve_target_reference
@@ -66,19 +72,34 @@ class AgentKernel:
         "file.extract_text",
         "file.metadata",
         "file.preview",
+        "file.open_path",
+        "file.reveal_in_explorer",
+        "image.describe",
+        "image.inspect",
+        "image.read_text",
         "document_agent.summarize",
         "document_agent.read",
         "document_agent.inspect",
+        "document_agent.compose",
         "document_agent.edit",
+        "memory.recall",
         "qq.get_current_context",
         "qq.get_recent_messages",
         "qq.get_last_reply",
         "qq.search_history",
         "qq.get_recent_attachments",
         "qq.search_contacts",
+        "qq.send_text",
+        "qq.send_file",
+        "qq.send_voice",
         "web.search",
         "web.research",
         "web.fetch",
+        "system.get_time",
+        "system.create_reminder",
+        "system.create_scheduled_task",
+        "system.list_reminders",
+        "system.cancel_reminder",
     }
     _WORKFLOW_SPEED_LESSON = (
         "\u6267\u884c\u7b56\u7565\u53c2\u8003\uff1a\u5bf9\u5355\u6b65\u3001\u4f4e\u98ce\u9669\u3001"
@@ -112,7 +133,6 @@ class AgentKernel:
         self.request_intent_analyzer = RequestIntentAnalyzer(llm_client)
         self.intent_service = IntentService(self.request_intent_analyzer)
         self.validator = DecisionValidator(config.workspace_root, registry)
-        self.workflow_argument_planner = WorkflowArgumentPlanner(llm_client, registry)
         self.path_normalizer = WorkspacePathNormalizer(config.workspace_root)
         self.local_collection_workflow = LocalCollectionWorkflow(config.workspace_root, llm_client=llm_client)
         self.completion_judge = CompletionJudge()
@@ -147,56 +167,97 @@ class AgentKernel:
         except Exception:  # noqa: BLE001
             return
 
-
-    @staticmethod
-    def _extract_scheduled_task_fire_context(runtime_channel_context: dict[str, Any] | None) -> dict[str, Any] | None:
-        if not isinstance(runtime_channel_context, dict):
-            return None
-        scheduled_task = runtime_channel_context.get("scheduled_task")
-        if not isinstance(scheduled_task, dict):
-            return None
-        phase = str(scheduled_task.get("phase") or "").strip().lower()
-        if not phase:
-            return None
-        return {
-            **scheduled_task,
-            "phase": phase,
-            "task_type": str(scheduled_task.get("task_type") or "").strip().lower() or None,
-            "message": str(scheduled_task.get("message") or "").strip(),
-        }
-
-    def _should_schedule_request(
-        self,
-        task_classification,
-        *,
-        runtime_channel_context: dict[str, Any] | None = None,
-    ) -> bool:
-        if task_classification is None:
-            return False
-        fire_context = self._extract_scheduled_task_fire_context(runtime_channel_context)
-        if fire_context is not None and fire_context.get("phase") == "fired":
-            return False
-        run_mode = str(getattr(task_classification, "run_mode", "immediate") or "immediate").strip().lower()
-        return run_mode == "scheduled"
-
-    def _build_scheduled_task_goal(
-            self,
-            *,
-            user_text: str,
-            task_type: str,
-    ) -> TaskGoal:
-        summary = f"Create a scheduled task for: {user_text}"
-        if task_type == "notify":
-            return TaskGoal(
-                summary=summary,
-                required_outputs=[],
-                completion_mode="success",
+    def _write_turn_trace_audit(self, trace_id: str) -> None:
+        trace_path = getattr(getattr(self, "trace_store", None), "trace_path", None)
+        if trace_path is None:
+            return
+        try:
+            paths = write_trace_audit_files(trace_path=trace_path, trace_id=trace_id)
+            self.trace_store.append(
+                "trace_audit_written",
+                {"trace_id": trace_id, **paths},
             )
-        return TaskGoal(
-            summary=summary,
-            required_outputs=[],
-            completion_mode="success",
+        except Exception as exc:  # noqa: BLE001
+            try:
+                self.trace_store.append("trace_audit_error", {"trace_id": trace_id, "error": str(exc)})
+            except Exception:
+                return
+
+    def _append_self_diagnosis(
+        self,
+        *,
+        execution_summary: dict[str, Any],
+        loop_stop_reason: str,
+        trace_id: str,
+        user_text: str,
+    ) -> None:
+        """任务异常终止时自动分析 trace，给出根因和修复建议。
+
+        不自动改代码，只生成诊断报告写入 trace 和回复中。
+        """
+        trace_path = getattr(getattr(self, "trace_store", None), "trace_path", None)
+        if not trace_path:
+            return
+
+        # 从 execution_summary 中提取关键错误信息
+        tool_errors = []
+        tool_successes = []
+        for result in (execution_summary.get("tool_results") or []):
+            if not isinstance(result, dict):
+                continue
+            tool_name = str(result.get("tool_name") or "")
+            if result.get("status") == "error":
+                err_msg = str(result.get("error", "") or "")
+                if isinstance(result.get("error"), dict):
+                    err_msg = str(result["error"].get("message") or result["error"])
+                tool_errors.append((tool_name, err_msg[:200]))
+            elif result.get("status") == "success":
+                data_keys = list((result.get("data") or {}).keys())
+                tool_successes.append((tool_name, data_keys))
+
+        # 构建精简的诊断 prompt
+        diag_prompt = (
+            f"你是银狼 agent 的自诊断模块。请分析以下任务失败的原因并给出简明的修复建议。\n\n"
+            f"停止原因: {loop_stop_reason}\n"
+            f"用户请求: {user_text[:200]}\n"
+            f"成功步骤: {json.dumps(tool_successes[-5:], ensure_ascii=False)}\n"
+            f"失败步骤: {json.dumps(tool_errors[-5:], ensure_ascii=False)}\n"
+            f"缺失输出: {execution_summary.get('missing_outputs', [])}\n\n"
+            f"请用中文简洁回答（3-5句）：1) 根因是什么 2) 应该怎么修（改代码/改 prompt/改配置） 3) 用户现在该怎么办。"
         )
+
+        diagnosis = ""
+        try:
+            chat_model = str(getattr(self.config, "chat_model", "") or getattr(self.config, "model", "") or "").strip()
+            raw = self.llm_client._chat(
+                [
+                    {"role": "system", "content": "You are an honest, concise debug assistant. Diagnose agent failures in Chinese. Be specific about root cause and fix. Keep it under 150 characters."},
+                    {"role": "user", "content": diag_prompt},
+                ],
+                model=chat_model or None,
+            )
+            diagnosis = str(raw).strip() if raw else ""
+        except Exception:
+            diagnosis = ""
+
+        self.trace_store.append(
+            "self_diagnosis",
+            {
+                "trace_id": trace_id,
+                "loop_stop_reason": loop_stop_reason,
+                "tool_errors": tool_errors,
+                "diagnosis": diagnosis,
+            },
+        )
+
+        # 如果诊断有效，追加到 history 中让最终回复能看到
+        if diagnosis:
+            self.history.append(
+                Message(
+                    role=Role.SYSTEM,
+                    content=f"[自诊断] 任务因 {loop_stop_reason} 终止。诊断结果: {diagnosis[:300]}",
+                )
+            )
 
     @staticmethod
     def _emit_progress(
@@ -225,7 +286,8 @@ class AgentKernel:
 
     def _local_scope_hints(self) -> dict[str, str]:
         hints: dict[str, str] = {}
-        workspace_root = str(getattr(self.config, "workspace_root", "") or "").strip()
+        config = getattr(self, "config", None)
+        workspace_root = str(getattr(config, "workspace_root", "") or "").strip()
         if workspace_root:
             hints["workspace"] = workspace_root
 
@@ -241,13 +303,1350 @@ class AgentKernel:
                 hints[alias] = str(candidate)
         return hints
 
-    def _recent_conversation_text(self, limit: int = 6) -> str:
+    def _local_scope_hints_for_context(self, *texts: str) -> dict[str, str]:
+        hints = self._local_scope_hints()
+        evidence = "\n".join(str(text or "") for text in texts if str(text or "").strip()).lower()
+        if not evidence:
+            return {}
+
+        alias_markers = {
+            "workspace": ("workspace", "工作区", "项目目录", "本地项目"),
+            "desktop": ("desktop", "桌面"),
+            "downloads": ("downloads", "download", "下载"),
+            "documents": ("documents", "document", "文档"),
+            "pictures": ("pictures", "picture", "图片", "照片"),
+        }
+        scoped: dict[str, str] = {}
+        for alias, path in hints.items():
+            normalized_path = str(path or "").lower()
+            markers = alias_markers.get(alias, (alias,))
+            if any(marker and marker.lower() in evidence for marker in markers) or (
+                normalized_path and normalized_path in evidence
+            ):
+                scoped[alias] = path
+        return scoped
+
+    def _recent_conversation_text(self, limit: int = 20) -> str:
         visible_messages = [
             f"{message.role.value}: {message.content}"
             for message in self.history
             if message.role in {Role.SYSTEM, Role.USER, Role.ASSISTANT}
         ]
         return "\n".join(visible_messages[-limit:])
+
+    def _build_single_source_intent_bundle(
+        self,
+        *,
+        user_text: str,
+        recent_context: str,
+        hot_context_summary: str,
+        warm_memory_summary: str,
+        learning_memory_summary: str,
+        cold_memory_summary: str,
+        active_task_summary: str,
+        channel_context_summary: str,
+    ) -> IntentBundle:
+        context_layers_used = [
+            name
+            for name, value in (
+                ("recent_context", recent_context),
+                ("active_task_summary", active_task_summary),
+                ("channel_context_summary", channel_context_summary),
+                ("hot_context_summary", hot_context_summary),
+                ("warm_memory_summary", warm_memory_summary),
+                ("learning_memory_summary", learning_memory_summary),
+                ("cold_memory_summary", cold_memory_summary),
+            )
+            if str(value or "").strip()
+        ]
+        memory_candidate = None
+        try:
+            memory_candidate = self.intent_service.analyze_memory_candidate(
+                user_text,
+                recent_context=recent_context,
+                hot_context_summary=hot_context_summary,
+                warm_memory_summary=warm_memory_summary,
+                learning_memory_summary=learning_memory_summary,
+                cold_memory_summary=cold_memory_summary,
+                active_task_summary=active_task_summary,
+                channel_context_summary=channel_context_summary,
+            )
+        except Exception:
+            memory_candidate = None
+        instruction_intent = self.intent_service._derive_instruction_intent(memory_candidate) if memory_candidate is not None else None
+        contract: dict[str, Any] = {}
+        contract_planner = getattr(self.llm_client, "plan_main_agent_contract", None)
+        if callable(contract_planner):
+            try:
+                contract = contract_planner(
+                    user_text=user_text,
+                    recent_context=recent_context,
+                    active_task_summary=active_task_summary,
+                    channel_context_summary=channel_context_summary,
+                    hot_context_summary=hot_context_summary,
+                    warm_memory_summary=warm_memory_summary,
+                    learning_memory_summary=learning_memory_summary,
+                    cold_memory_summary=cold_memory_summary,
+                    local_scope_hints=self._local_scope_hints_for_context(
+                        user_text,
+                        recent_context,
+                        active_task_summary,
+                        channel_context_summary,
+                        hot_context_summary,
+                        warm_memory_summary,
+                        cold_memory_summary,
+                    ),
+                    tool_manifests=self.registry.list_manifests(),
+                )
+            except Exception as exc:  # noqa: BLE001
+                contract = {"contract_error": str(exc)}
+        contract = self._normalize_main_agent_contract(contract, user_text=user_text)
+        recent_file_artifact = self._extract_recent_file_artifact_path(channel_context_summary)
+        if recent_file_artifact and self._request_refers_to_recent_file(user_text):
+            grounded = contract.get("grounded_inputs") if isinstance(contract.get("grounded_inputs"), dict) else {}
+            grounded = dict(grounded)
+            grounded.setdefault("target_path", recent_file_artifact)
+            grounded.setdefault("file_path", recent_file_artifact)
+            grounded.setdefault("resolved_subject", Path(recent_file_artifact).name)
+            grounded.setdefault("source_context", str(Path(recent_file_artifact).parent))
+            grounded.setdefault("reference_resolution", "recent_file_artifact")
+            contract["grounded_inputs"] = grounded
+
+        primary_objective = str(contract.get("primary_objective") or user_text or "").strip()
+        required_outputs = [
+            item for item in (contract.get("required_outputs") or [])
+            if isinstance(item, OutputKind)
+        ]
+        preferred_tools = [
+            tool
+            for tool in (contract.get("preferred_tools") or [])
+            if isinstance(tool, str) and self.registry.has_tool(tool)
+        ]
+        grounded_inputs = contract.get("grounded_inputs") if isinstance(contract.get("grounded_inputs"), dict) else {}
+        workflow_spec = contract.get("workflow_spec") if isinstance(contract.get("workflow_spec"), WorkflowSpec) else None
+        constraints = [
+            str(item).strip()
+            for item in (contract.get("constraints") or [])
+            if str(item).strip()
+        ]
+
+        delegated_brief_parts = [
+            "mode=main_agent_single_source",
+            f"objective={primary_objective}",
+            "rule=Use recent context, active task state, channel context, memories, and tool results directly. Do not reclassify or narrow the task through a secondary planner.",
+            "rule=Downstream tools execute the main agent decision only; if required outputs are missing, continue or ask a concrete clarification.",
+        ]
+        if preferred_tools:
+            delegated_brief_parts.append("preferred_tools=" + ", ".join(preferred_tools))
+        if required_outputs:
+            delegated_brief_parts.append("required_outputs=" + ", ".join(output.value for output in required_outputs))
+        if workflow_spec is not None and workflow_spec.nodes:
+            delegated_brief_parts.append(
+                "workflow_nodes="
+                + json.dumps(
+                    [node.model_dump(mode="json") for node in workflow_spec.nodes],
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
+        if grounded_inputs:
+            delegated_brief_parts.append(
+                "grounded_inputs=" + json.dumps(grounded_inputs, ensure_ascii=False, sort_keys=True)
+            )
+        if constraints:
+            delegated_brief_parts.append("constraints=" + " | ".join(constraints))
+        if active_task_summary.strip():
+            delegated_brief_parts.append("active_task=" + active_task_summary.strip())
+        if channel_context_summary.strip():
+            delegated_brief_parts.append("channel_context=" + channel_context_summary.strip()[:900])
+        execution_notes = [
+            "The main agent contract is authoritative for task scope and completion.",
+            "Downstream tools and recovery state machines must not replace the original required_outputs.",
+            *constraints,
+        ]
+        if contract.get("contract_error"):
+            execution_notes.append("main_agent_contract_planner_error=" + str(contract.get("contract_error")))
+        return IntentBundle(
+            memory_candidate_intent=memory_candidate or MemoryCandidateIntent(),
+            instruction_intent=instruction_intent or InstructionIntent(),
+            task_classification=None,
+            answerability=AnswerabilityAssessment(
+                answerability="main_agent_decides",
+                preferred_family="main_agent",
+                local_answer_kind="none",
+                answer_basis=context_layers_used,
+                confidence=1.0,
+                rationale="single_source_main_agent",
+            ),
+            task_envelope=TaskEnvelope(
+                mode="main_agent",
+                conversation_mode=str(contract.get("conversation_mode") or "").strip()
+                or ("continuation" if str(recent_context or "").strip() else "new_request"),
+                primary_objective=primary_objective,
+                needs_grounding=bool(contract.get("needs_grounding", bool(required_outputs))),
+                context_layers_used=context_layers_used,
+                allowed_families=[
+                    str(item).strip()
+                    for item in (contract.get("allowed_families") or [])
+                    if str(item).strip()
+                ],
+                blocked_families=[
+                    str(item).strip()
+                    for item in (contract.get("blocked_families") or [])
+                    if str(item).strip()
+                ],
+                required_outputs=required_outputs,
+                preferred_tools=preferred_tools,
+                planning_focus_text=json.dumps(grounded_inputs, ensure_ascii=False, sort_keys=True) if grounded_inputs else None,
+                execution_notes=execution_notes,
+                delegated_execution_brief="\n".join(delegated_brief_parts),
+                workflow_spec=workflow_spec,
+                rationale=str(contract.get("rationale") or "single_source_main_agent").strip(),
+            ),
+        )
+
+    @staticmethod
+    def _contract_objective_is_placeholder(value: str) -> bool:
+        normalized = str(value or "").strip().lower()
+        if not normalized:
+            return True
+        return normalized in {
+            "full user deliverable after resolving context",
+            "full user deliverable",
+            "primary objective",
+            "complete the active task",
+        }
+
+    def _normalize_main_agent_contract(self, contract: dict[str, Any] | None, *, user_text: str) -> dict[str, Any]:
+        normalized = dict(contract or {})
+        if self._contract_objective_is_placeholder(str(normalized.get("primary_objective") or "")):
+            normalized["primary_objective"] = str(user_text or "").strip()
+
+        manifests = {
+            manifest.tool_name: manifest
+            for manifest in self.registry.list_manifests()
+        }
+        if self._contract_mentions_qq_recent_messages(normalized):
+            if "qq.get_recent_messages" in manifests:
+                normalized["workflow_nodes"] = [
+                    {
+                        "node_id": "step_1",
+                        "tool": "qq.get_recent_messages",
+                        "intent": "read recent QQ messages from the active channel runtime",
+                        "reason": "The user asked for recent QQ messages; use the QQ runtime instead of local documents or web search.",
+                        "produces": [output.value for output in manifests["qq.get_recent_messages"].produces],
+                    }
+                ]
+                normalized["preferred_tools"] = ["qq.get_recent_messages"]
+                normalized["allowed_families"] = ["qq_history"]
+            else:
+                blocked_families = [
+                    str(item).strip()
+                    for item in normalized.get("blocked_families") or []
+                    if str(item).strip()
+                ]
+                for family in ("web_lookup", "document_summary", "document_operation", "local_lookup", "file_lookup"):
+                    if family not in blocked_families:
+                        blocked_families.append(family)
+                normalized["primary_objective"] = (
+                    "Tell the user the QQ runtime is unavailable, so recent QQ messages cannot be read in this turn."
+                )
+                normalized["workflow_nodes"] = [
+                    {
+                        "node_id": "step_1",
+                        "tool": None,
+                        "intent": "explain that the QQ runtime is unavailable for reading recent messages",
+                        "reason": "Recent QQ messages require the active QQ runtime; web or local files are not valid substitutes.",
+                        "produces": [OutputKind.MESSAGE_SENT.value],
+                    }
+                ]
+                normalized["preferred_tools"] = []
+                normalized["allowed_families"] = []
+                normalized["blocked_families"] = blocked_families
+        preferred_tools: list[str] = []
+        for item in normalized.get("preferred_tools") or []:
+            tool_name = str(item or "").strip()
+            if tool_name and tool_name in manifests and tool_name not in preferred_tools:
+                preferred_tools.append(tool_name)
+
+        workflow_nodes: list[WorkflowNodeSpec] = []
+        available_workflow_outputs: set[OutputKind] = set()
+        output_rewrites: dict[OutputKind, list[OutputKind]] = {}
+        for index, item in enumerate(normalized.get("workflow_nodes") or [], start=1):
+            if not isinstance(item, dict):
+                continue
+            node_payload = dict(item)
+            node_payload.setdefault("node_id", f"step_{index}")
+            tool_name = str(node_payload.get("tool") or "").strip()
+            if self._contract_node_should_use_qq_recent_messages(normalized, node_payload, manifests):
+                tool_name = "qq.get_recent_messages"
+                node_payload["produces"] = list(manifests["qq.get_recent_messages"].produces)
+            if tool_name == "web.search" and "web.research" in manifests:
+                tool_name = "web.research"
+            node_payload["tool"] = tool_name if tool_name in manifests else None
+            try:
+                node = WorkflowNodeSpec.model_validate(node_payload)
+            except Exception:
+                continue
+
+            original_produces = list(node.produces)
+            if node.tool and node.tool in manifests:
+                manifest_outputs = list(manifests[node.tool].produces)
+                fixed_produces = [output_kind for output_kind in node.produces if output_kind in manifest_outputs]
+                if node.tool == "web.research" and manifest_outputs:
+                    fixed_produces = manifest_outputs
+                if not fixed_produces and manifest_outputs:
+                    fixed_produces = manifest_outputs
+                if fixed_produces != node.produces:
+                    node = node.model_copy(update={"produces": fixed_produces})
+                if original_produces and fixed_produces:
+                    for output_kind in original_produces:
+                        if output_kind not in fixed_produces:
+                            output_rewrites[output_kind] = fixed_produces
+
+            if not node.produces:
+                continue
+            if node.requires:
+                rewritten_requires: list[OutputKind] = []
+                for output_kind in node.requires:
+                    replacements = output_rewrites.get(output_kind)
+                    if replacements:
+                        for replacement in replacements:
+                            if replacement not in rewritten_requires:
+                                rewritten_requires.append(replacement)
+                    elif output_kind not in rewritten_requires:
+                        rewritten_requires.append(output_kind)
+                executable_requires = [
+                    output_kind
+                    for output_kind in rewritten_requires
+                    if output_kind in available_workflow_outputs and output_kind not in node.produces
+                ]
+                if executable_requires != node.requires:
+                    node = node.model_copy(update={"requires": executable_requires})
+            workflow_nodes.append(node)
+            available_workflow_outputs.update(node.produces)
+            if node.tool and node.tool not in preferred_tools:
+                preferred_tools.append(node.tool)
+        workflow_nodes = self._insert_document_compose_nodes(workflow_nodes, manifests)
+        for node in workflow_nodes:
+            if node.tool and node.tool not in preferred_tools:
+                preferred_tools.append(node.tool)
+        normalized["preferred_tools"] = preferred_tools
+
+        required_outputs: list[OutputKind] = []
+        for item in normalized.get("required_outputs") or []:
+            if isinstance(item, OutputKind) and item not in required_outputs:
+                required_outputs.append(item)
+            elif isinstance(item, str):
+                try:
+                    output_kind = OutputKind(item.strip())
+                except ValueError:
+                    continue
+                if output_kind not in required_outputs:
+                    required_outputs.append(output_kind)
+
+        if workflow_nodes:
+            required_outputs = []
+            for node in workflow_nodes:
+                for output_kind in node.produces:
+                    if output_kind not in required_outputs:
+                        required_outputs.append(output_kind)
+        else:
+            inferred_outputs: list[OutputKind] = []
+            for tool_name in preferred_tools:
+                for output_kind in manifests[tool_name].produces:
+                    if output_kind not in inferred_outputs:
+                        inferred_outputs.append(output_kind)
+            shallow_outputs = {OutputKind.OBJECT_CANDIDATES, OutputKind.CONTACT_CANDIDATES, OutputKind.DIRECTORY_ENTRIES}
+            if inferred_outputs and (not required_outputs or set(required_outputs).issubset(shallow_outputs)):
+                for output_kind in inferred_outputs:
+                    if output_kind not in required_outputs:
+                        required_outputs.append(output_kind)
+        normalized["required_outputs"] = required_outputs
+        normalized["workflow_spec"] = WorkflowSpec(
+            workflow_name=str(normalized.get("workflow_name") or "main_agent_contract").strip() or "main_agent_contract",
+            goal=TaskGoal(
+                summary=str(normalized.get("primary_objective") or user_text or "").strip(),
+                required_outputs=required_outputs,
+                completion_mode="outputs",
+            ) if required_outputs else None,
+            nodes=workflow_nodes,
+        ) if workflow_nodes else None
+
+        allowed_families = [
+            str(item).strip()
+            for item in normalized.get("allowed_families") or []
+            if str(item).strip()
+        ]
+        blocked_families = [
+            str(item).strip()
+            for item in normalized.get("blocked_families") or []
+            if str(item).strip()
+        ]
+        for tool_name in preferred_tools:
+            family = self._tool_family_for_selected_tool(tool_name)
+            if family and family not in blocked_families and family not in allowed_families:
+                allowed_families.append(family)
+        normalized["allowed_families"] = allowed_families
+        normalized["blocked_families"] = blocked_families
+
+        if preferred_tools or required_outputs:
+            normalized["needs_grounding"] = True
+        return normalized
+
+    @staticmethod
+    def _insert_document_compose_nodes(
+        workflow_nodes: list[WorkflowNodeSpec],
+        manifests: dict[str, Any],
+    ) -> list[WorkflowNodeSpec]:
+        if "document_agent.compose" not in manifests or not workflow_nodes:
+            return workflow_nodes
+        if any(node.tool == "document_agent.compose" for node in workflow_nodes):
+            return workflow_nodes
+
+        inserted: list[WorkflowNodeSpec] = []
+        has_prior_web = False
+        for node in workflow_nodes:
+            if node.tool in {"web.research", "web.fetch"} or OutputKind.WEB_CONTENT in node.produces:
+                has_prior_web = True
+            if has_prior_web and node.tool == "file.write_docx":
+                compose_manifest = manifests["document_agent.compose"]
+                inserted.append(
+                    WorkflowNodeSpec(
+                        node_id="compose_document",
+                        tool="document_agent.compose",
+                        intent="compose final document content from grounded web and tool materials",
+                        reason="Document content should be synthesized before writing.",
+                        requires=[OutputKind.WEB_CONTENT],
+                        produces=list(compose_manifest.produces) or [OutputKind.FILE_CONTENTS, OutputKind.OBJECT_DETAILS],
+                    )
+                )
+                requires = list(node.requires)
+                if OutputKind.FILE_CONTENTS not in requires:
+                    requires.append(OutputKind.FILE_CONTENTS)
+                node = node.model_copy(update={"requires": requires})
+                has_prior_web = False
+            inserted.append(node)
+        return inserted
+
+    @staticmethod
+    def _contract_node_should_use_qq_recent_messages(
+        normalized_contract: dict[str, Any],
+        node_payload: dict[str, Any],
+        manifests: dict[str, ToolManifest],
+    ) -> bool:
+        if "qq.get_recent_messages" not in manifests:
+            return False
+        raw_tool = str(node_payload.get("tool") or "").strip()
+        if raw_tool and raw_tool.startswith("qq."):
+            return False
+        haystack = " ".join(
+            str(value or "")
+            for value in (
+                normalized_contract.get("primary_objective"),
+                normalized_contract.get("grounded_inputs"),
+                node_payload.get("intent"),
+                node_payload.get("reason"),
+            )
+        ).lower()
+        mentions_qq = "qq" in haystack
+        mentions_messages = any(marker in haystack for marker in ("message", "messages", "消息", "聊天", "history", "历史"))
+        mentions_recent = any(marker in haystack for marker in ("recent", "last", "latest", "最近", "最后", "前两", "两句"))
+        return mentions_qq and mentions_messages and mentions_recent
+
+    @classmethod
+    def _contract_should_use_qq_recent_messages(
+        cls,
+        normalized_contract: dict[str, Any],
+        manifests: dict[str, ToolManifest],
+    ) -> bool:
+        if "qq.get_recent_messages" not in manifests:
+            return False
+        haystack_parts = [
+            normalized_contract.get("primary_objective"),
+            normalized_contract.get("grounded_inputs"),
+            normalized_contract.get("preferred_tools"),
+            normalized_contract.get("allowed_families"),
+        ]
+        for node in normalized_contract.get("workflow_nodes") or []:
+            if isinstance(node, dict):
+                haystack_parts.extend([node.get("tool"), node.get("intent"), node.get("reason"), node.get("produces")])
+        haystack = " ".join(str(value or "") for value in haystack_parts).lower()
+        mentions_qq = "qq" in haystack
+        mentions_messages = any(marker in haystack for marker in ("message", "messages", "消息", "聊天", "history", "历史"))
+        mentions_recent = any(marker in haystack for marker in ("recent", "last", "latest", "最近", "最后", "前两", "两句"))
+        return mentions_qq and mentions_messages and mentions_recent
+
+    @staticmethod
+    def _contract_mentions_qq_recent_messages(normalized_contract: dict[str, Any]) -> bool:
+        haystack_parts = [
+            normalized_contract.get("primary_objective"),
+            normalized_contract.get("grounded_inputs"),
+            normalized_contract.get("preferred_tools"),
+            normalized_contract.get("allowed_families"),
+        ]
+        for node in normalized_contract.get("workflow_nodes") or []:
+            if isinstance(node, dict):
+                haystack_parts.extend([node.get("tool"), node.get("intent"), node.get("reason"), node.get("produces")])
+        haystack = " ".join(str(value or "") for value in haystack_parts).lower()
+        mentions_qq = "qq" in haystack
+        mentions_messages = any(
+            marker in haystack
+            for marker in ("message", "messages", "消息", "聊天", "history", "历史", "娑堟伅", "鑱婂ぉ", "鍘嗗彶")
+        )
+        mentions_recent = any(
+            marker in haystack
+            for marker in ("recent", "last", "latest", "最近", "最后", "前两", "两句", "鏈€杩?", "鏈€鍚?", "鍓嶄袱", "涓ゅ彞")
+        )
+        return mentions_qq and mentions_messages and mentions_recent
+
+    @staticmethod
+    def _parse_task_envelope_grounded_inputs(task_envelope) -> dict[str, Any]:
+        raw = str(getattr(task_envelope, "planning_focus_text", "") or "").strip()
+        if not raw:
+            return {}
+        try:
+            payload = json.loads(raw)
+        except Exception:  # noqa: BLE001
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    @staticmethod
+    def _first_grounded_string(grounded_inputs: dict[str, Any], *keys: str) -> str:
+        for key in keys:
+            value = grounded_inputs.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return ""
+
+    @staticmethod
+    def _latest_tool_time(tool_results: list[ToolCallResult] | None) -> datetime | None:
+        for result in reversed(tool_results or []):
+            if result.status != "success" or result.tool_name != "system.get_time":
+                continue
+            iso = str(result.data.get("iso") or "").strip()
+            if not iso:
+                continue
+            try:
+                return datetime.fromisoformat(iso)
+            except ValueError:
+                continue
+        return None
+
+    @staticmethod
+    def _contract_recent_user_message_time(task_envelope) -> datetime | None:
+        brief = str(getattr(task_envelope, "delegated_execution_brief", "") or "")
+        if not brief:
+            return None
+        matches = re.findall(r"(?m)^\s*-\s*(20\d{2}-\d{2}-\d{2}T[0-9:.+-]+):\s*", brief)
+        parsed: list[datetime] = []
+        for raw in matches:
+            try:
+                dt = datetime.fromisoformat(raw)
+            except ValueError:
+                continue
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            parsed.append(dt)
+        if not parsed:
+            return None
+        return max(parsed).astimezone(timezone(timedelta(hours=8)))
+
+    @staticmethod
+    def _parse_explicit_local_datetime(text: str, *, default_tz) -> str:
+        match = re.search(
+            r"(?P<date>20\d{2}[-/年]\d{1,2}[-/月]\d{1,2})\s*(?:日|号)?\s*"
+            r"(?P<hour>\d{1,2})\s*(?::|点)\s*(?P<minute>\d{1,2})?",
+            str(text or ""),
+        )
+        if not match:
+            return ""
+
+    @staticmethod
+    def _normalize_chinese_time_digits(text: str) -> str:
+        digit_map = {
+            "零": 0,
+            "〇": 0,
+            "一": 1,
+            "二": 2,
+            "两": 2,
+            "三": 3,
+            "四": 4,
+            "五": 5,
+            "六": 6,
+            "七": 7,
+            "八": 8,
+            "九": 9,
+        }
+
+        def cn_number(value: str) -> int | None:
+            value = value.strip()
+            if not value:
+                return None
+            if value == "十":
+                return 10
+            if value.startswith("十"):
+                tail = digit_map.get(value[1:], None)
+                return 10 + int(tail or 0)
+            if "十" in value:
+                head, tail = value.split("十", 1)
+                head_value = digit_map.get(head, None)
+                tail_value = digit_map.get(tail, 0) if tail else 0
+                if head_value is None or tail_value is None:
+                    return None
+                return int(head_value) * 10 + int(tail_value)
+            if len(value) == 1 and value in digit_map:
+                return digit_map[value]
+            return None
+
+        def replace_with_unit(match: re.Match[str]) -> str:
+            number = cn_number(match.group("num"))
+            if number is None:
+                return match.group(0)
+            return f"{number}{match.group('unit')}"
+
+        return re.sub(
+            r"(?P<num>[零〇一二两三四五六七八九十]{1,3})(?P<unit>点|分钟|小时)",
+            replace_with_unit,
+            str(text or ""),
+        )
+        date_text = match.group("date").replace("年", "-").replace("月", "-").replace("/", "-")
+        parts = [int(part) for part in date_text.strip("-").split("-")]
+        minute = int(match.group("minute") or 0)
+        try:
+            return datetime(
+                parts[0],
+                parts[1],
+                parts[2],
+                int(match.group("hour")),
+                minute,
+                0,
+                tzinfo=default_tz,
+            ).isoformat()
+        except (ValueError, TypeError):
+            return ""
+
+    def _infer_when_iso_from_contract_context(
+        self,
+        *,
+        grounded_inputs: dict[str, Any],
+        task_envelope,
+        user_text: str,
+        tool_results: list[ToolCallResult] | None = None,
+        timezone_name: str = "Asia/Shanghai",
+    ) -> str:
+        explicit = self._first_grounded_string(grounded_inputs, "when_iso", "scheduled_for", "time_iso", "datetime_iso")
+        if explicit:
+            return explicit
+        now = self._contract_recent_user_message_time(task_envelope) or self._latest_tool_time(tool_results)
+        if now is None:
+            now = datetime.now(timezone(timedelta(hours=8)))
+        tz = now.tzinfo or timezone(timedelta(hours=8))
+        combined = "\n".join(
+            part
+            for part in (
+                str(getattr(task_envelope, "primary_objective", "") or ""),
+                str(getattr(task_envelope, "planning_focus_text", "") or ""),
+                str(user_text or ""),
+                self._first_grounded_string(grounded_inputs, "resolved_subject", "source_context", "instruction", "task"),
+            )
+            if part
+        )
+        normalized_combined = self._normalize_chinese_time_digits(combined)
+        explicit_local = self._parse_explicit_local_datetime(normalized_combined, default_tz=tz)
+        if explicit_local:
+            return explicit_local
+        parsed = parse_when_text(when_text=normalized_combined, now=now, timezone_name=timezone_name or "Asia/Shanghai")
+        return "" if parsed is None else parsed.isoformat()
+
+    @classmethod
+    def _infer_reminder_message_from_contract_context(
+        cls,
+        *,
+        grounded_inputs: dict[str, Any],
+        task_envelope,
+        user_text: str,
+        fallback: str = "",
+    ) -> str:
+        explicit = cls._first_grounded_string(grounded_inputs, "message", "text", "reply_text", "speech_text")
+        if explicit:
+            return explicit
+        combined = "\n".join(
+            part
+            for part in (
+                str(user_text or ""),
+                str(getattr(task_envelope, "planning_focus_text", "") or ""),
+                str(getattr(task_envelope, "primary_objective", "") or ""),
+            )
+            if part
+        )
+        quote_match = re.search(
+            r"(?:message|text|content|\u63d0\u9192\u6d88\u606f\u5185\u5bb9|\u901a\u77e5\u5185\u5bb9|\u63d0\u9192\u5185\u5bb9)\s*[:\uff1a]\s*['\"]([^'\"]{1,80})['\"]",
+            combined,
+            re.I,
+        )
+        if quote_match:
+            return quote_match.group(1).strip()
+        lines = [line.strip() for line in re.split(r"[\r\n]+", str(user_text or "")) if line.strip()]
+        source = "\n".join(lines) if lines else str(user_text or "")
+        cleaned = cls._normalize_chinese_time_digits(source)
+        cleaned = re.sub(r"\d+\s*(?:\u5206\u949f|\u5c0f\u65f6)\u540e", " ", cleaned)
+        cleaned = re.sub(
+            r"(?:\u534a\u5c0f\u65f6\u540e|\u4eca\u5929|\u660e\u5929|\u540e\u5929|\u4e0a\u5348|\u4e2d\u5348|\u4e0b\u5348|\u665a\u4e0a|\u508d\u665a|\u51cc\u6668|\u65e9\u4e0a|\u65e9\u6668)?\s*\d{1,2}\s*(?:\u70b9|:)\s*\d{0,2}",
+            " ",
+            cleaned,
+        )
+        cleaned = re.sub(r"(?:\u63d0\u9192\u6211|\u53eb\u6211|\u558a\u6211|\u544a\u8bc9\u6211|\u8ba9\u6211)", " ", cleaned)
+        cleaned = re.sub(
+            r"(?:\u8bf7|\u5e2e\u6211|\u7ed9\u6211|\u5230\u65f6|\u5230\u65f6\u5019|\u8bbe\u7f6e|\u8bbe\u4e2a|\u95f9\u949f|\u63d0\u9192|\u901a\u77e5|\u53d1QQ|QQ|\u5f53\u524d\u4f1a\u8bdd|\u4e00\u4e0b|\u4e00\u4e0b\u5427)",
+            " ",
+            cleaned,
+        )
+        cleaned = re.sub(r"\s+", " ", cleaned).strip(" \uff0c,\u3002.!！?？\uff1a:")
+        if cleaned:
+            return cleaned[:80]
+        fallback_text = str(fallback or getattr(task_envelope, "primary_objective", "") or "").strip()
+        fallback_text = re.sub(r"^\s*(?:\u5728)?\d+\s*(?:\u5206\u949f|\u5c0f\u65f6)\u540e", "", fallback_text).strip(" \uff0c,\u3002")
+        return fallback_text[:80]
+
+    def _build_cached_reminder_fire_text(self, message: str) -> str:
+        clean_message = str(message or "").strip()
+        if not clean_message:
+            return ""
+        llm_client = getattr(self, "llm_client", None)
+        if llm_client is not None and hasattr(llm_client, "render_reminder_fire_text"):
+            try:
+                rendered = llm_client.render_reminder_fire_text(
+                    reminder_message=clean_message,
+                    persona_name=str(getattr(self.config, "persona_name", "") or ""),
+                    persona_profile=str(getattr(self.config, "persona_profile", "") or ""),
+                    chat_style_prompt=str(getattr(self.config, "chat_style_prompt", "") or ""),
+                )
+                rendered = str(rendered or "").strip()
+                if rendered:
+                    return rendered[:120]
+            except Exception:
+                pass
+        return clean_message[:120]
+
+    def _ensure_cached_reminder_payload(self, task_payload: Any, message: str) -> dict[str, Any]:
+        payload = dict(task_payload or {}) if isinstance(task_payload, dict) else {}
+        if str(message or "").strip() and not str(payload.get("fire_text") or "").strip():
+            payload["fire_text"] = self._build_cached_reminder_fire_text(str(message or "").strip())
+            payload["fire_text_source"] = "creation_time_persona_render"
+        return payload
+
+    @staticmethod
+    def _build_contract_file_path_from_subject(subject: str, source_context: str) -> str:
+        clean_subject = str(subject or "").strip().strip("\"'")
+        if not clean_subject:
+            return ""
+        subject_path = Path(clean_subject)
+        if subject_path.is_absolute() or len(subject_path.parts) > 1:
+            return clean_subject
+        if "." not in subject_path.name:
+            return ""
+        clean_scope = str(source_context or "").strip().strip("\"'")
+        if clean_scope and clean_scope.lower() not in {"web", "qq", "current chat", "local chat history"}:
+            return str(Path(clean_scope) / clean_subject)
+        return clean_subject
+
+    def _build_contract_docx_path(self, *, subject: str, source_context: str, user_text: str) -> str:
+        explicit_path = self._extract_requested_output_file(user_text)
+        if explicit_path:
+            path = Path(explicit_path)
+            if path.suffix.lower() != ".docx":
+                path = path.with_suffix(".docx")
+            return str(path)
+
+        clean_subject = str(subject or "").strip().strip("\"'") or "查询结果"
+        safe_title = re.sub(r"[^A-Za-z0-9\u4e00-\u9fff._-]+", "-", clean_subject).strip("-._") or "查询结果"
+        if not safe_title.lower().endswith(".docx"):
+            safe_title = f"{safe_title}.docx"
+
+        clean_scope = str(source_context or "").strip().strip("\"'")
+        if clean_scope and Path(clean_scope).is_absolute():
+            base_dir = Path(clean_scope)
+        else:
+            base_dir = Path(getattr(getattr(self, "config", None), "workspace_root", "") or ".")
+        return str(base_dir / safe_title)
+
+    @staticmethod
+    def _split_docx_paragraphs(content: str) -> list[str]:
+        paragraphs = [part.strip(" -\t") for part in re.split(r"\n{1,}|\s{2,}", str(content or "")) if part.strip()]
+        return paragraphs[:24]
+
+    @staticmethod
+    def _build_docx_content_from_tool_results(tool_results: list[ToolCallResult]) -> str:
+        for result in reversed(tool_results):
+            if result.status != "success":
+                continue
+            if result.tool_name not in {"web.research", "web.search", "web.fetch"}:
+                continue
+            chunks: list[str] = []
+            observation = result.metrics.get("observation") if isinstance(result.metrics, dict) else None
+            if observation:
+                chunks.append(str(observation))
+            for key in ("summary", "answer", "content", "text"):
+                value = result.data.get(key)
+                if isinstance(value, str) and value.strip():
+                    chunks.append(value.strip())
+            for key in ("results", "sources", "pages"):
+                value = result.data.get(key)
+                if isinstance(value, list):
+                    for item in value[:6]:
+                        if isinstance(item, dict):
+                            title = str(item.get("title") or item.get("name") or item.get("url") or "").strip()
+                            snippet = str(item.get("snippet") or item.get("summary") or item.get("content") or "").strip()
+                            url = str(item.get("url") or item.get("source") or "").strip()
+                            line = " - ".join(part for part in (title, snippet, url) if part)
+                            if line:
+                                chunks.append(line)
+                        elif isinstance(item, str) and item.strip():
+                            chunks.append(item.strip())
+            if chunks:
+                text = "\n".join(chunks)
+                return text[:6000]
+        return ""
+
+    def _repair_decision_arguments_from_task_contract(
+        self,
+        decision: ToolDecision,
+        *,
+        task_envelope,
+    ) -> tuple[ToolDecision, dict[str, Any] | None]:
+        if decision.decision != DecisionType.TOOL_CALL or not decision.selected_tool:
+            return decision, None
+        grounded_inputs = self._parse_task_envelope_grounded_inputs(task_envelope)
+        if not grounded_inputs:
+            return decision, None
+
+        selected_tool = str(decision.selected_tool or "").strip()
+        arguments = dict(decision.arguments or {})
+        repaired = False
+
+        subject = self._first_grounded_string(
+            grounded_inputs,
+            "resolved_subject",
+            "target_name",
+            "target",
+            "query",
+            "topic",
+            "search_query",
+        )
+        source_context = self._first_grounded_string(
+            grounded_inputs,
+            "source_context",
+            "scope",
+            "path",
+            "path_scope",
+            "directory",
+        )
+        target_path = self._first_grounded_string(
+            grounded_inputs,
+            "target_path",
+            "source_path",
+            "file_path",
+            "path",
+        )
+        instruction = self._first_grounded_string(
+            grounded_inputs,
+            "instruction",
+            "task",
+            "edit_instruction",
+            "operation",
+        ) or str(getattr(task_envelope, "primary_objective", "") or "").strip()
+        url = self._first_grounded_string(grounded_inputs, "url", "target_url", "source_url")
+        contact_query = self._first_grounded_string(
+            grounded_inputs,
+            "contact_query",
+            "contact",
+            "contact_name",
+            "person",
+            "group",
+        )
+        message = self._first_grounded_string(
+            grounded_inputs,
+            "message",
+            "text",
+            "reply_text",
+            "speech_text",
+        )
+        if selected_tool in {"system.create_reminder", "system.create_scheduled_task"}:
+            message = self._infer_reminder_message_from_contract_context(
+                grounded_inputs=grounded_inputs,
+                task_envelope=task_envelope,
+                user_text=str(getattr(task_envelope, "primary_objective", "") or ""),
+                fallback=instruction,
+            )
+        when_iso = self._first_grounded_string(grounded_inputs, "when_iso", "scheduled_for", "time_iso", "datetime_iso")
+        timezone_name = self._first_grounded_string(grounded_inputs, "timezone", "timezone_name", "tz")
+        if not when_iso and selected_tool in {"system.create_reminder", "system.create_scheduled_task"}:
+            when_iso = self._infer_when_iso_from_contract_context(
+                grounded_inputs=grounded_inputs,
+                task_envelope=task_envelope,
+                user_text=str(getattr(task_envelope, "primary_objective", "") or ""),
+                timezone_name=timezone_name or "Asia/Shanghai",
+            )
+        session_id = self._first_grounded_string(grounded_inputs, "session_id", "target_session_id")
+        channel = self._first_grounded_string(grounded_inputs, "channel", "runtime_channel")
+        task_type = self._first_grounded_string(grounded_inputs, "task_type", "schedule_type")
+        reminder_id = self._first_grounded_string(grounded_inputs, "reminder_id", "id")
+
+        if selected_tool == "memory.recall":
+            query = subject or instruction or str(getattr(task_envelope, "primary_objective", "") or "").strip()
+            if query and not str(arguments.get("query") or "").strip():
+                arguments["query"] = query
+                repaired = True
+            arguments.setdefault("limit", 5)
+        elif selected_tool == "file.search_by_name":
+            if subject and not str(arguments.get("query") or "").strip():
+                arguments["query"] = subject
+                plan = self._build_local_retrieval_plan(subject, user_text=str(getattr(task_envelope, "primary_objective", "") or ""))
+                if plan.get("query_terms") and not arguments.get("query_terms"):
+                    arguments["query_terms"] = plan["query_terms"]
+                if plan.get("alias_terms") and not arguments.get("alias_terms"):
+                    arguments["alias_terms"] = plan["alias_terms"]
+                if plan.get("extensions") and not arguments.get("extensions"):
+                    arguments["extensions"] = plan["extensions"]
+                repaired = True
+            if source_context and not str(arguments.get("path") or "").strip():
+                arguments["path"] = source_context
+                repaired = True
+            if "path" in arguments or "query" in arguments:
+                arguments.setdefault("recursive", True)
+                arguments.setdefault("include_dirs", True)
+                arguments.setdefault("scope_mode", "subtree")
+                arguments.setdefault("target_kind", "file")
+                arguments.setdefault("top_k", 8)
+        elif selected_tool == "retrieval.search_local_objects":
+            if subject and not str(arguments.get("query") or "").strip():
+                arguments["query"] = subject
+                repaired = True
+            if source_context and not str(arguments.get("path_scope") or "").strip():
+                arguments["path_scope"] = source_context
+                repaired = True
+            if "path_scope" in arguments or "query" in arguments:
+                arguments.setdefault("scope_mode", "subtree")
+                arguments.setdefault("target_kind", "file")
+                arguments.setdefault("top_k", 8)
+                arguments.setdefault("rebuild_if_missing", True)
+        elif selected_tool == "file.list":
+            if source_context and not str(arguments.get("path") or "").strip():
+                arguments["path"] = source_context
+                repaired = True
+            if "path" in arguments:
+                arguments.setdefault("recursive", True)
+                arguments.setdefault("include_dirs", True)
+        elif selected_tool in {"web.search", "web.research"}:
+            if subject and not str(arguments.get("query") or "").strip():
+                arguments["query"] = subject
+                repaired = True
+            if selected_tool == "web.research" and "query" in arguments:
+                arguments.setdefault("max_results", 5)
+                arguments.setdefault("max_pages", 2)
+                arguments.setdefault("prefer_browser", True)
+            elif selected_tool == "web.search" and "query" in arguments:
+                arguments.setdefault("max_results", 5)
+        elif selected_tool in {"web.fetch", "web.open_page"}:
+            if url and not str(arguments.get("url") or "").strip():
+                arguments["url"] = url
+                repaired = True
+        elif selected_tool in {"qq.search_history", "qq.get_last_reply", "qq.get_recent_attachments"}:
+            if selected_tool == "qq.search_history" and subject and not str(arguments.get("query") or "").strip():
+                arguments["query"] = subject
+                repaired = True
+            if contact_query and not str(arguments.get("contact_query") or "").strip():
+                arguments["contact_query"] = contact_query
+                repaired = True
+            if selected_tool == "qq.get_recent_attachments":
+                arguments.setdefault("kind", "any")
+                arguments.setdefault("limit", 5)
+            elif selected_tool == "qq.search_history":
+                arguments.setdefault("limit", 5)
+        elif selected_tool == "qq.search_contacts":
+            query = contact_query or subject
+            if query and not str(arguments.get("query") or "").strip():
+                arguments["query"] = query
+                repaired = True
+            arguments.setdefault("target_kind", "any")
+            arguments.setdefault("limit", 5)
+        elif selected_tool == "qq.send_text":
+            if message and not str(arguments.get("message") or "").strip():
+                arguments["message"] = message
+                repaired = True
+            arguments.setdefault("target_kind", "current")
+        elif selected_tool == "qq.send_file":
+            if target_path and not str(arguments.get("file_path") or "").strip():
+                arguments["file_path"] = target_path
+                repaired = True
+            arguments.setdefault("target_kind", "current")
+        elif selected_tool == "qq.send_voice":
+            if message and not str(arguments.get("speech_text") or "").strip() and not str(arguments.get("audio_path") or "").strip():
+                arguments["speech_text"] = message
+                repaired = True
+            arguments.setdefault("target_kind", "current")
+        elif selected_tool == "document_agent.compose":
+            if instruction and not str(arguments.get("instruction") or "").strip():
+                arguments["instruction"] = instruction
+                repaired = True
+            if target_path and not str(arguments.get("output_path") or "").strip():
+                arguments["output_path"] = target_path
+                repaired = True
+            if grounded_inputs and not isinstance(arguments.get("grounded_inputs"), dict):
+                arguments["grounded_inputs"] = grounded_inputs
+                repaired = True
+            arguments.setdefault("recent_context", "")
+            arguments.setdefault("resolved_facts", {})
+            arguments.setdefault("source_materials", {})
+            arguments.setdefault("constraints", {})
+            arguments.setdefault("style_hints", {})
+        elif selected_tool in {"document_agent.summarize", "document_agent.read", "document_agent.inspect", "document_agent.edit"}:
+            if target_path and not str(arguments.get("source_path") or "").strip():
+                arguments["source_path"] = target_path
+                repaired = True
+            if instruction and selected_tool != "document_agent.read" and not str(arguments.get("instruction") or "").strip():
+                arguments["instruction"] = instruction
+                repaired = True
+            elif instruction and selected_tool == "document_agent.read" and "instruction" not in arguments:
+                arguments["instruction"] = instruction
+                repaired = True
+            if grounded_inputs and not isinstance(arguments.get("grounded_inputs"), dict):
+                arguments["grounded_inputs"] = grounded_inputs
+                repaired = True
+            arguments.setdefault("recent_context", "")
+            arguments.setdefault("resolved_facts", {})
+            arguments.setdefault("source_materials", {})
+            arguments.setdefault("constraints", {})
+            arguments.setdefault("style_hints", {})
+            if selected_tool == "document_agent.edit":
+                arguments.setdefault("allow_overwrite", True)
+                arguments.setdefault("preserve_structure", True)
+                arguments.setdefault("preserve_style", True)
+        elif selected_tool == "system.get_time":
+            if not str(arguments.get("kind") or "").strip():
+                arguments["kind"] = self._first_grounded_string(grounded_inputs, "kind", "time_kind") or "datetime"
+                repaired = True
+            if timezone_name and not str(arguments.get("timezone_name") or "").strip():
+                arguments["timezone_name"] = timezone_name
+                repaired = True
+        elif selected_tool in {"system.create_reminder", "system.create_scheduled_task"}:
+            if selected_tool == "system.create_scheduled_task" and not str(arguments.get("task_type") or "").strip():
+                arguments["task_type"] = task_type or "notify"
+                repaired = True
+            if when_iso and not str(arguments.get("when_iso") or "").strip():
+                arguments["when_iso"] = when_iso
+                repaired = True
+            if not str(arguments.get("timezone") or "").strip():
+                arguments["timezone"] = timezone_name or "Asia/Shanghai"
+                repaired = True
+            if (message or instruction) and not str(arguments.get("message") or "").strip():
+                arguments["message"] = message or instruction
+                repaired = True
+            task_payload = grounded_inputs.get("task_payload")
+            cached_payload = self._ensure_cached_reminder_payload(task_payload, str(arguments.get("message") or message or instruction or ""))
+            if isinstance(task_payload, dict) and "task_payload" not in arguments:
+                arguments["task_payload"] = cached_payload
+                repaired = True
+            elif "task_payload" not in arguments:
+                arguments["task_payload"] = cached_payload
+                repaired = True
+            elif isinstance(arguments.get("task_payload"), dict):
+                updated_payload = self._ensure_cached_reminder_payload(
+                    arguments.get("task_payload"),
+                    str(arguments.get("message") or message or instruction or ""),
+                )
+                if updated_payload != arguments.get("task_payload"):
+                    arguments["task_payload"] = updated_payload
+                    repaired = True
+            if session_id and not str(arguments.get("session_id") or "").strip():
+                arguments["session_id"] = session_id
+                repaired = True
+            if channel and not str(arguments.get("channel") or "").strip():
+                arguments["channel"] = channel
+                repaired = True
+        elif selected_tool == "system.list_reminders":
+            if not str(arguments.get("status") or "").strip():
+                arguments["status"] = self._first_grounded_string(grounded_inputs, "status") or "scheduled"
+                repaired = True
+            if session_id and not str(arguments.get("session_id") or "").strip():
+                arguments["session_id"] = session_id
+                repaired = True
+        elif selected_tool == "system.cancel_reminder":
+            if reminder_id and not str(arguments.get("reminder_id") or "").strip():
+                arguments["reminder_id"] = reminder_id
+                repaired = True
+
+        if not repaired:
+            return decision, None
+        repaired_decision = decision.model_copy(update={"arguments": arguments})
+        return repaired_decision, {
+            "reason": "repaired_tool_arguments_from_main_contract",
+            "selected_tool": selected_tool,
+            "filled_fields": sorted(set(arguments) - set(decision.arguments or {})),
+        }
+
+    def _try_repair_missing_arguments(
+        self,
+        *,
+        decision: ToolDecision,
+        error: str,
+        user_text: str,
+        recent_context: str,
+        trace_id: str,
+        step: int,
+        tool_results: list[ToolCallResult] | None = None,
+    ) -> ToolDecision | None:
+        """当 decision 因缺少必填字段被 DecisionValidationError 拒绝时，调用 LLM 补全参数。
+
+        不做复杂的 planner pipeline，极简 prompt 只要求 LLM 返回修复后的 JSON。
+        """
+        selected_tool = str(decision.selected_tool or "").strip()
+        if not selected_tool:
+            return None
+
+        grounded_repair = self._repair_missing_arguments_from_tool_results(
+            decision=decision,
+            tool_results=tool_results or [],
+        )
+        if grounded_repair is not None:
+            return grounded_repair
+
+        # 从错误消息中提取缺失的字段名
+        import re as _re
+        missing_field_match = _re.search(r"requires non-empty (\w+)", error)
+        if not missing_field_match:
+            missing_field_match = _re.search(r"requires (?:a )?non-empty (\w+)", error)
+        if not missing_field_match:
+            missing_field_match = _re.search(r"(\w+) must be a ", error)
+
+        missing_field = (
+            missing_field_match.group(1).strip() if missing_field_match else ""
+        )
+
+        existing_args = dict(decision.arguments or {})
+        # 去掉 metadata 类字段让 prompt 更干净
+        for meta_key in ("execution_brief", "required_outputs", "grounded_inputs", "constraints"):
+            existing_args.pop(meta_key, None)
+
+        # 获取当前时间作为上下文
+        try:
+            from datetime import datetime as _dt
+            from datetime import timezone as _tz, timedelta as _td
+            now_local = _dt.now(_tz(_td(hours=8)))
+            now_text = now_local.strftime("%Y-%m-%d %H:%M:%S") + " CST (UTC+8)"
+        except Exception:
+            now_text = "(unknown time)"
+
+        prompt = (
+            f"你是一个工具参数补全助手。以下工具调用缺少必填参数，请根据上下文补全后返回完整的 JSON 对象。\n\n"
+            f"工具名称: {selected_tool}\n"
+            f"已有参数: {json.dumps(existing_args, ensure_ascii=False)}\n"
+            f"缺失的必填字段: {missing_field or '(从错误消息推断)'}\n"
+            f"验证错误: {error}\n"
+            f"用户原始请求: {user_text}\n"
+            f"当前时间: {now_text}\n"
+            f"最近对话上下文: {recent_context[-800:] if recent_context else '(无)'}\n\n"
+            f"请返回一个完整有效的 JSON object，补全所有必填字段。只返回 JSON，不要任何解释文字。"
+        )
+
+        # 用 chat_model 做极简补全
+        chat_model = str(getattr(self.config, "chat_model", "") or getattr(self.config, "model", "") or "").strip()
+        try:
+            raw = self.llm_client._chat(  # noqa: SLF001
+                [
+                    {"role": "system", "content": "You are a JSON argument repair assistant. Return ONLY valid JSON, no explanation."},
+                    {"role": "user", "content": prompt},
+                ],
+                model=chat_model or None,
+            )
+        except Exception:
+            return None
+
+        if not raw or not raw.strip():
+            return None
+
+        # 尝试从 LLM 输出中提取 JSON
+        def _extract_json_braces(text: str) -> str | None:
+            start_idx = text.find("{")
+            end_idx = text.rfind("}")
+            if start_idx == -1 or end_idx == -1 or end_idx <= start_idx:
+                return None
+            return text[start_idx:end_idx + 1]
+
+        json_candidate = None
+        for extraction in (raw.strip(), _extract_json_braces(raw)):
+            if not extraction:
+                continue
+            try:
+                json_candidate = json.loads(extraction)
+                if isinstance(json_candidate, dict):
+                    break
+            except json.JSONDecodeError:
+                continue
+
+        if not isinstance(json_candidate, dict) or not json_candidate:
+            return None
+
+        # 合并：LLM 结果 + 原有参数 → 用 LLM 结果覆盖缺失字段
+        merged = dict(existing_args)
+        merged.update(json_candidate)
+
+        return ToolDecision(
+            decision=DecisionType.TOOL_CALL,
+            intent=decision.intent,
+            reason=f"{decision.reason} [arguments repaired by LLM]",
+            selected_tool=selected_tool,
+            arguments=merged,
+            risk_level=decision.risk_level,
+            overall_task_goal=decision.overall_task_goal,
+            expected_step_outputs=decision.expected_step_outputs,
+        )
+
+    def _repair_missing_arguments_from_tool_results(
+        self,
+        *,
+        decision: ToolDecision,
+        tool_results: list[ToolCallResult],
+    ) -> ToolDecision | None:
+        selected_tool = str(decision.selected_tool or "").strip()
+        arguments = dict(decision.arguments or {})
+        source_context = ""
+        grounded_inputs = arguments.get("grounded_inputs")
+        if isinstance(grounded_inputs, dict):
+            source_context = self._first_grounded_string(
+                grounded_inputs,
+                "source_context",
+                "scope",
+                "path",
+                "path_scope",
+                "directory",
+            ) or ""
+        if selected_tool == "file.metadata_many" and not arguments.get("paths"):
+            paths = self._latest_listed_image_paths(tool_results, source_context=source_context)
+            if paths:
+                arguments["paths"] = paths
+                arguments.setdefault("continue_on_error", True)
+        elif selected_tool == "file.mkdir_many" and not arguments.get("paths"):
+            paths = self._image_organization_folder_paths(tool_results, source_context=source_context)
+            if paths:
+                arguments["paths"] = paths
+                arguments.setdefault("exist_ok", True)
+                arguments.setdefault("parents", True)
+                arguments.setdefault("continue_on_error", True)
+        elif selected_tool in {"file.move_many", "file.copy_many"} and not arguments.get("items"):
+            items = self._image_organization_move_items(tool_results, source_context=source_context)
+            if items:
+                arguments["items"] = items
+                arguments.setdefault("continue_on_error", True)
+        else:
+            return None
+
+        if arguments == (decision.arguments or {}):
+            return None
+        return decision.model_copy(
+            update={
+                "arguments": arguments,
+                "reason": f"{decision.reason} [arguments filled from prior tool results]",
+            }
+        )
+
+    def _route_unsafe_document_write_decision(
+        self,
+        decision: ToolDecision,
+        *,
+        task_envelope,
+    ) -> tuple[ToolDecision, dict[str, Any] | None]:
+        if decision.decision != DecisionType.TOOL_CALL:
+            return decision, None
+        if str(decision.selected_tool or "").strip() != "file.write":
+            return decision, None
+        if not self.registry.has_tool("document_agent.edit"):
+            return decision, None
+
+        arguments = dict(decision.arguments or {})
+        target_path = str(arguments.get("path") or "").strip()
+        if not target_path or not self._looks_like_document_agent_editable_path(target_path):
+            return decision, None
+        if not Path(target_path).exists():
+            return decision, None
+
+        grounded_inputs = self._parse_task_envelope_grounded_inputs(task_envelope)
+        instruction = self._first_grounded_string(
+            grounded_inputs,
+            "instruction",
+            "task",
+            "edit_instruction",
+            "operation",
+        ) or str(getattr(task_envelope, "primary_objective", "") or "").strip()
+        if not instruction:
+            instruction = "Edit the document according to the main-agent task contract."
+
+        routed_arguments = {
+            "source_path": target_path,
+            "instruction": instruction,
+            "allow_overwrite": True,
+            "preserve_structure": True,
+            "preserve_style": True,
+            "grounded_inputs": grounded_inputs,
+            "recent_context": "",
+            "resolved_facts": {},
+            "source_materials": {},
+            "constraints": {},
+            "style_hints": {},
+        }
+        expected_outputs = list(decision.expected_step_outputs or [])
+        if OutputKind.FILE_WRITTEN not in expected_outputs:
+            expected_outputs.append(OutputKind.FILE_WRITTEN)
+        routed = decision.model_copy(
+            update={
+                "selected_tool": "document_agent.edit",
+                "arguments": routed_arguments,
+                "expected_step_outputs": expected_outputs,
+                "reason": (
+                    str(decision.reason or "").strip()
+                    + " Routed Office/document writes through document_agent.edit to preserve formatting and embedded media."
+                ).strip(),
+            }
+        )
+        return routed, {
+            "reason": "routed_document_write_to_document_agent_edit",
+            "original_tool": "file.write",
+            "selected_tool": "document_agent.edit",
+            "path": target_path,
+            "preserve_structure": True,
+            "preserve_style": True,
+        }
+
+    @staticmethod
+    def _format_main_agent_context_observation(
+        *,
+        user_text: str,
+        recent_context: str,
+        active_task_summary: str,
+        channel_context_summary: str,
+        hot_context_summary: str,
+        warm_memory_summary: str,
+        learning_memory_summary: str,
+        cold_memory_summary: str,
+    ) -> str:
+        sections: list[str] = [
+            "Main agent is the single source of task understanding.",
+            f"Latest user request: {str(user_text or '').strip()}",
+        ]
+        for label, value, limit in (
+            ("Recent conversation", recent_context, 1600),
+            ("Active task state", active_task_summary, 900),
+            ("Channel context", channel_context_summary, 1200),
+            ("Hot context", hot_context_summary, 700),
+            ("Warm memory", warm_memory_summary, 700),
+            ("Learning memory", learning_memory_summary, 700),
+            ("Cold memory", cold_memory_summary, 500),
+        ):
+            text = str(value or "").strip()
+            if text:
+                sections.append(f"{label}:\n{text[-limit:]}")
+        return "\n\n".join(sections)
 
     @staticmethod
     def _build_channel_context_summary(
@@ -320,7 +1719,99 @@ class AgentKernel:
                 if rendered_messages:
                     parts.append("recent_user_messages:\n" + "\n".join(rendered_messages))
 
+            group_context_messages = runtime_channel_context.get("group_context_messages")
+            if isinstance(group_context_messages, list):
+                rendered_group_messages: list[str] = []
+                for item in group_context_messages[-12:]:
+                    if not isinstance(item, dict):
+                        continue
+                    text = str(item.get("text") or "").strip()
+                    if not text:
+                        continue
+                    role = str(item.get("role") or "").strip()
+                    sender_name = str(item.get("sender_name") or "").strip()
+                    sender_id = str(item.get("sender_id") or "").strip()
+                    created_at = str(item.get("created_at") or "").strip()
+                    label = sender_name or sender_id or role or "unknown"
+                    prefix = f"{created_at} " if created_at else ""
+                    rendered_group_messages.append(f"- {prefix}{label}: {text}")
+                if rendered_group_messages:
+                    parts.append("group_context_messages:\n" + "\n".join(rendered_group_messages))
+
+            recent_artifacts = runtime_channel_context.get("recent_artifacts")
+            if isinstance(recent_artifacts, list):
+                rendered_artifacts: list[str] = []
+                for item in recent_artifacts[-6:]:
+                    if not isinstance(item, dict):
+                        continue
+                    kind = str(item.get("kind") or "artifact").strip()
+                    role = str(item.get("role") or "").strip()
+                    title = str(item.get("title") or "").strip()
+                    path = str(item.get("path") or "").strip()
+                    created_at = str(item.get("created_at") or "").strip()
+                    if not path and not title:
+                        continue
+                    fields = [f"kind={kind}"]
+                    if role:
+                        fields.append(f"role={role}")
+                    if title:
+                        fields.append(f"title={title}")
+                    if path:
+                        fields.append(f"path={path}")
+                    if created_at:
+                        fields.append(f"created_at={created_at}")
+                    rendered_artifacts.append("- " + "; ".join(fields))
+                if rendered_artifacts:
+                    parts.append("recent_artifacts:\n" + "\n".join(rendered_artifacts))
+
+            last_file = runtime_channel_context.get("last_file_artifact")
+            if isinstance(last_file, dict):
+                path = str(last_file.get("path") or "").strip()
+                title = str(last_file.get("title") or "").strip()
+                role = str(last_file.get("role") or "").strip()
+                if path or title:
+                    parts.append(
+                        "last_file_artifact="
+                        + "; ".join(
+                            part
+                            for part in (
+                                f"title={title}" if title else "",
+                                f"path={path}" if path else "",
+                                f"role={role}" if role else "",
+                            )
+                            if part
+                        )
+                    )
+
         return "\n".join(parts)
+
+    @staticmethod
+    def _request_refers_to_recent_file(user_text: str) -> bool:
+        text = str(user_text or "")
+        if not text.strip():
+            return False
+        file_markers = ("这个文件", "这份文件", "这个文档", "这份文档", "刚才那个", "刚刚那个", "上一个文件", "刚发的文件", "刚生成的文件")
+        operation_markers = ("删", "删除", "打开", "发", "发送", "改", "修改", "重命名", "移动", "复制", "看看", "读", "读取")
+        return any(marker in text for marker in file_markers) and any(marker in text for marker in operation_markers)
+
+    @staticmethod
+    def _extract_recent_file_artifact_path(channel_context_summary: str) -> str:
+        text = str(channel_context_summary or "")
+        if not text.strip():
+            return ""
+        patterns = [
+            r"last_file_artifact=.*?path=([^;\n]+)",
+            r"recent_artifacts:[\s\S]*?path=([^;\n]+)",
+            r"last_written_file=([^\n]+)",
+            r"last_sent_file=([^\n]+)",
+        ]
+        for pattern in patterns:
+            matches = re.findall(pattern, text)
+            for raw in reversed(matches):
+                candidate = str(raw or "").strip().strip("'\"")
+                if candidate:
+                    return candidate
+        return ""
 
     @staticmethod
     def _merge_goals(
@@ -629,17 +2120,27 @@ class AgentKernel:
             return "web_lookup"
         if tool == "web.open_page":
             return "web_target"
+        if tool.startswith("computer."):
+            return "computer_control"
+        if tool.startswith("image."):
+            return "image_understanding"
+        if tool.startswith("memory."):
+            return "memory"
         if tool.startswith("qq.send_"):
             return "delivery"
         if tool.startswith("qq."):
             return "qq_history"
+        if tool.startswith("skill."):
+            return "skill"
+        if tool.startswith("app."):
+            return "app_control"
         if tool.startswith("system.") or tool.startswith("time.") or tool.startswith("calendar."):
             return "system_utility"
         if tool in {"retrieval.search_local_objects", "file.search_by_name", "file.list", "file.read", "file.extract_text", "file.extract_structure"}:
             return "local_lookup"
         if tool in {"file.metadata", "file.preview", "file.open_path", "file.reveal_in_explorer"}:
             return "file_lookup"
-        if tool in {"document_agent.summarize", "document_agent.read", "document_agent.inspect"}:
+        if tool in {"document_agent.summarize", "document_agent.read", "document_agent.inspect", "document_agent.compose"}:
             return "document_summary"
         if tool in {"document_agent.edit", "file.edit_docx", "file.write", "file.write_many", "file.append", "file.append_many"}:
             return "document_operation"
@@ -699,7 +2200,7 @@ class AgentKernel:
         has_grounding_outputs = bool(
             {OutputKind.SEARCH_RESULTS, OutputKind.WEB_CONTENT} & completed_output_set
         )
-        if decision.decision == DecisionType.RESPOND and not decision.selected_tool and goal_missing_outputs:
+        if decision.decision in {DecisionType.RESPOND, DecisionType.FINISH} and not decision.selected_tool and goal_missing_outputs:
             allowed_families = {
                 str(item).strip()
                 for item in getattr(task_envelope, "allowed_families", []) or []
@@ -737,7 +2238,7 @@ class AgentKernel:
                 "missing_outputs": [item.value for item in goal_missing_outputs],
             }
         if (
-            decision.decision == DecisionType.RESPOND
+            decision.decision in {DecisionType.RESPOND, DecisionType.FINISH}
             and not decision.selected_tool
             and requires_grounding_outputs
             and not has_grounding_outputs
@@ -783,6 +2284,8 @@ class AgentKernel:
             return decision, None
 
         selected_tool = str(decision.selected_tool or "").strip()
+        if selected_tool.startswith("skill."):
+            return decision, None
         family = self._tool_family_for_selected_tool(selected_tool)
         allowed_families = {
             str(item).strip()
@@ -918,6 +2421,25 @@ class AgentKernel:
 
         return False
 
+    def _should_auto_approve_low_risk_tool_decision(self, decision: ToolDecision) -> bool:
+        if decision.decision != DecisionType.TOOL_CALL:
+            return False
+        if not decision.selected_tool:
+            return False
+        if decision.memory_write:
+            return False
+        if decision.risk_level != RiskLevel.LOW:
+            return False
+        if decision.selected_tool not in self._TRUSTED_STATE_MACHINE_TOOLS:
+            return False
+
+        manifest = self.registry.get_manifest(decision.selected_tool)
+        if not manifest.read_only:
+            return False
+        if manifest.destructive or manifest.requires_confirmation:
+            return False
+        return True
+
     @classmethod
     def _should_short_circuit_state_machine_repair(
         cls,
@@ -955,34 +2477,36 @@ class AgentKernel:
             return bool(str(arguments.get("url") or "").strip())
         if selected_tool.startswith("qq."):
             return bool(arguments) or selected_tool in {"qq.get_current_context", "qq.get_last_reply"}
+        if selected_tool == "file.search_by_name":
+            return bool(str(arguments.get("path") or "").strip() and str(arguments.get("query") or "").strip())
+        if selected_tool == "retrieval.search_local_objects":
+            return bool(str(arguments.get("path_scope") or arguments.get("path") or "").strip() and str(arguments.get("query") or "").strip())
+        if selected_tool == "file.list":
+            return bool(str(arguments.get("path") or "").strip())
+        if selected_tool in {"file.read", "file.extract_text", "image.read_text"}:
+            paths = arguments.get("paths")
+            return isinstance(paths, list) and any(str(path or "").strip() for path in paths)
+        if selected_tool in {"file.metadata", "file.preview", "file.open_path", "file.reveal_in_explorer", "image.describe", "image.inspect"}:
+            return bool(str(arguments.get("path") or "").strip())
+        if selected_tool == "document_agent.compose":
+            return bool(str(arguments.get("instruction") or "").strip())
+        if selected_tool in {"document_agent.summarize", "document_agent.read", "document_agent.inspect", "document_agent.edit"}:
+            return bool(str(arguments.get("source_path") or "").strip())
+        if selected_tool == "memory.recall":
+            return bool(str(arguments.get("query") or "").strip())
+        if selected_tool == "system.get_time":
+            return True
+        if selected_tool in {"system.create_reminder", "system.create_scheduled_task"}:
+            has_time = bool(str(arguments.get("when_iso") or "").strip())
+            has_message = bool(str(arguments.get("message") or "").strip())
+            if selected_tool == "system.create_scheduled_task":
+                return has_time and has_message and bool(str(arguments.get("task_type") or "").strip())
+            return has_time and has_message
+        if selected_tool == "system.list_reminders":
+            return True
+        if selected_tool == "system.cancel_reminder":
+            return bool(str(arguments.get("reminder_id") or "").strip())
         return False
-
-    @classmethod
-    def _should_use_locked_workflow_decision(
-        cls,
-        workflow_decision: ToolDecision | None,
-        *,
-        workflow_family: str,
-        request_signatures: set[str],
-        request_signature: Callable[[ToolDecision], str],
-    ) -> bool:
-        if workflow_decision is None:
-            return False
-        if workflow_family not in {"document_operation", "document_summary", "file_lookup", "local_lookup", "llm_workflow_spec"}:
-            return False
-        if workflow_decision.decision != DecisionType.TOOL_CALL:
-            return False
-        if not workflow_decision.selected_tool:
-            return False
-        if workflow_decision.selected_tool not in cls._TRUSTED_STATE_MACHINE_TOOLS:
-            return False
-        if workflow_decision.memory_write:
-            return False
-        if workflow_decision.risk_level != RiskLevel.LOW:
-            return False
-        if request_signature(workflow_decision) in request_signatures:
-            return False
-        return True
 
     @staticmethod
     def _should_use_state_machine_repair_after_planner_exception(
@@ -993,162 +2517,6 @@ class AgentKernel:
         if has_prior_progress:
             return True
         return knowledge_type in {"local_workspace", "qq_history", "system_utility"}
-
-    @staticmethod
-    def _initial_workflow_spec_skip_reason(intent_bundle) -> str | None:
-        task_classification = getattr(intent_bundle, "task_classification", None)
-        if task_classification is None:
-            return None
-        run_mode = str(getattr(task_classification, "run_mode", "") or "").strip().lower()
-        if run_mode == "scheduled":
-            return "scheduled_task"
-
-        try:
-            confidence = float(getattr(task_classification, "confidence", 0.0) or 0.0)
-        except (TypeError, ValueError):
-            confidence = 0.0
-        if confidence < 0.70:
-            return "low_confidence_defer_to_decision_loop"
-
-        document_delivery = getattr(intent_bundle, "document_delivery", None)
-        if document_delivery is not None and (
-            bool(getattr(document_delivery, "wants_document", False))
-            or bool(getattr(document_delivery, "save_output", False))
-        ):
-            return None
-
-        preferred_families = [
-            str(item).strip()
-            for item in getattr(task_classification, "preferred_families", []) or []
-            if str(item).strip()
-        ]
-        if confidence >= 0.88 and len(preferred_families) == 1:
-            return "llm_classified_single_family_high_confidence"
-        return None
-
-    def _plan_initial_workflow_spec(
-        self,
-        *,
-        user_text: str,
-        intent_bundle,
-        recent_context: str,
-        trace_id: str,
-    ) -> WorkflowSpec | None:
-        if not hasattr(self.llm_client, "plan_workflow_spec"):
-            return None
-        task_classification = getattr(intent_bundle, "task_classification", None)
-        if task_classification is None:
-            return None
-        if str(getattr(task_classification, "run_mode", "") or "") == "scheduled":
-            return None
-        skip_reason = self._initial_workflow_spec_skip_reason(intent_bundle)
-        if skip_reason is not None:
-            self.trace_store.append(
-                "workflow_spec_skipped",
-                {
-                    "trace_id": trace_id,
-                    "reason": skip_reason,
-                    "policy": "structured_intent_state_machine_reference",
-                },
-            )
-            return None
-        try:
-            spec = self.llm_client.plan_workflow_spec(
-                messages=self._context_messages(),
-                tool_manifests=self.registry.list_manifests(),
-                intent_bundle=intent_bundle.model_dump(mode="json"),
-                recent_context=recent_context,
-                max_nodes=6,
-            )
-        except Exception as exc:  # noqa: BLE001
-            self.trace_store.append("workflow_spec_error", {"trace_id": trace_id, "error": str(exc)})
-            return None
-        review = self._review_workflow_spec(spec)
-        self.trace_store.append(
-            "workflow_spec_review",
-            {
-                "trace_id": trace_id,
-                "workflow_spec": spec.model_dump(mode="json"),
-                "review": review,
-            },
-        )
-        if not review.get("approved"):
-            return None
-        return spec
-
-    def _review_workflow_spec(self, spec: WorkflowSpec) -> dict[str, object]:
-        issues: list[str] = []
-        if not spec.nodes:
-            issues.append("workflow_spec_empty")
-        if len(spec.nodes) > 8:
-            issues.append("workflow_spec_too_long")
-
-        available_tools = {manifest.tool_name for manifest in self.registry.list_manifests()}
-        produced: set[OutputKind] = set()
-        seen_ids: set[str] = set()
-        side_effect_nodes = 0
-        for index, node in enumerate(spec.nodes):
-            node_id = str(node.node_id or "").strip()
-            if not node_id:
-                issues.append(f"node_{index}_missing_id")
-            elif node_id in seen_ids:
-                issues.append(f"node_{index}_duplicate_id")
-            seen_ids.add(node_id)
-
-            if node.tool is None:
-                if index != len(spec.nodes) - 1:
-                    issues.append(f"{node_id or index}_response_node_not_last")
-                continue
-            if node.tool not in available_tools:
-                issues.append(f"{node_id or index}_unknown_tool:{node.tool}")
-                continue
-
-            missing_requires = [item.value for item in node.requires if item not in produced]
-            if missing_requires:
-                issues.append(f"{node_id or index}_requires_missing:{','.join(missing_requires)}")
-
-            manifest = self.registry.get_manifest(node.tool)
-            if manifest.side_effect:
-                side_effect_nodes += 1
-                if side_effect_nodes > 2:
-                    issues.append("workflow_spec_too_many_side_effects")
-                if node.tool.startswith("document_agent.") and OutputKind.OBJECT_CANDIDATES not in produced:
-                    issues.append(f"{node_id or index}_document_agent_without_target_candidates")
-
-            for output in node.produces or manifest.produces:
-                produced.add(output)
-
-        if spec.goal is not None:
-            missing_goal_outputs = [item.value for item in spec.goal.required_outputs if item not in produced]
-            if missing_goal_outputs:
-                issues.append(f"goal_outputs_not_produced:{','.join(missing_goal_outputs)}")
-
-        return {
-            "approved": not issues,
-            "issues": issues,
-            "summary": "Workflow spec passed deterministic graph review." if not issues else "Workflow spec was rejected by deterministic graph review.",
-        }
-
-    def _workflow_spec_node_to_decision(
-        self,
-        *,
-        spec: WorkflowSpec,
-        node: WorkflowNodeSpec,
-    ) -> ToolDecision | None:
-        if node.tool is None:
-            return None
-        manifest = self.registry.get_manifest(node.tool)
-        produces = list(node.produces or manifest.produces)
-        return ToolDecision(
-            decision=DecisionType.TOOL_CALL,
-            intent=node.intent or node.node_id,
-            reason=node.reason or f"Run locked workflow node {node.node_id}.",
-            selected_tool=node.tool,
-            arguments={},
-            risk_level=RiskLevel.LOW,
-            overall_task_goal=spec.goal,
-            expected_step_outputs=produces,
-        )
 
     @staticmethod
     def _looks_like_document_summary_request(user_text: str) -> bool:
@@ -1295,7 +2663,7 @@ class AgentKernel:
             "相关内容",
             "内容",
         ):
-            cleaned = re.sub("[,.!?:;()\\[\\]{}\"'`?????????????]+", " ", cleaned)
+            cleaned = re.sub(r"[,.!?:;，。！？：；、（）()《》【】\[\]{}\"'`]+", " ", cleaned)
         cleaned = cls._finalize_local_lookup_query(cleaned)
         return cleaned or user_text.strip()
 
@@ -1343,7 +2711,7 @@ class AgentKernel:
 
     @staticmethod
     def _looks_like_document_agent_editable_path(path: str) -> bool:
-        return Path(path).suffix.lower() in {".docx", ".md", ".txt"}
+        return Path(path).suffix.lower() in {".docx", ".md"}
 
     @staticmethod
     def _looks_like_image_path(path: str) -> bool:
@@ -1984,14 +3352,25 @@ class AgentKernel:
                 expected_step_outputs=[OutputKind.OBJECT_DETAILS],
             )
 
-        if action in {"extract_document_structure", "search_document_blocks"}:
+        if action in {"inspect", "extract_document_structure", "search_document_blocks"}:
             if OutputKind.OBJECT_DETAILS in completed_outputs:
                 return None
-            return cls._build_document_details_followup(
-                path=path,
-                user_text=user_text,
+            if cls._looks_like_document_path(path):
+                return cls._build_document_details_followup(
+                    path=path,
+                    user_text=user_text,
+                    overall_task_goal=overall_task_goal,
+                    reason="Delegate the grounded document inspection to the document sub-agent.",
+                )
+            return ToolDecision(
+                decision=DecisionType.TOOL_CALL,
+                intent="metadata_for_candidate",
+                reason="Read metadata for the most reliable candidate after candidate selection.",
+                selected_tool="file.metadata",
+                arguments={"path": path},
+                risk_level=RiskLevel.LOW,
                 overall_task_goal=overall_task_goal,
-                reason="Ground the requested document operation on structured blocks before editing or summarizing.",
+                expected_step_outputs=[OutputKind.OBJECT_DETAILS],
             )
 
         if action == "preview":
@@ -2164,13 +3543,12 @@ class AgentKernel:
             if (
                 OutputKind.FILE_CONTENTS in missing_outputs
                 and OutputKind.FILE_CONTENTS not in completed_outputs
-                and cls._looks_like_document_summary_request(user_text)
             ):
-                return cls._build_document_agent_summary_followup(
+                return cls._build_document_agent_read_followup(
                     user_text=user_text,
                     path=primary_path,
                     overall_task_goal=overall_task_goal,
-                    reason="State transition: the grounded document summary should now be handled by the document sub-agent.",
+                    reason="State transition: the grounded document should now be read by the document sub-agent.",
                 )
 
         if "read" in actions and OutputKind.FILE_CONTENTS in missing_outputs and OutputKind.FILE_CONTENTS not in completed_outputs:
@@ -2219,17 +3597,12 @@ class AgentKernel:
                     overall_task_goal=overall_task_goal,
                     expected_step_outputs=[OutputKind.OBJECT_DETAILS],
                 )
-            if cls._looks_like_document_path(primary_path) and (
-                cls._looks_like_document_structure_request(user_text)
-                or cls._looks_like_document_block_search_request(user_text)
-                or cls._goal_requires_document_details(overall_task_goal)
-                or cls._goal_requires_document_write(overall_task_goal)
-            ):
+            if cls._looks_like_document_path(primary_path):
                 return cls._build_document_details_followup(
                     path=primary_path,
                     user_text=user_text,
                     overall_task_goal=overall_task_goal,
-                    reason="State transition: ground the document operation on structured content before continuing.",
+                    reason="State transition: delegate the document inspection to the document sub-agent.",
                 )
             return ToolDecision(
                 decision=DecisionType.TOOL_CALL,
@@ -2243,6 +3616,749 @@ class AgentKernel:
             )
 
         return None
+
+    def _build_contract_workflow_followup(
+        self,
+        *,
+        workflow_spec: WorkflowSpec | None,
+        task_envelope: TaskEnvelope | None,
+        user_text: str,
+        candidate_state: CandidateState | None,
+        overall_task_goal: TaskGoal | None,
+        completed_outputs: list[OutputKind],
+        tool_results: list[ToolCallResult] | None = None,
+        supports_message_delivery: bool = False,
+    ) -> ToolDecision | None:
+        if workflow_spec is None or not workflow_spec.nodes:
+            return None
+
+        completed = set(completed_outputs)
+        goal = workflow_spec.goal or overall_task_goal
+        for node in workflow_spec.nodes:
+            produces = [output for output in node.produces if isinstance(output, OutputKind)]
+            if produces and set(produces).issubset(completed):
+                continue
+            requires = [output for output in node.requires if isinstance(output, OutputKind)]
+            if any(output not in completed for output in requires):
+                return None
+            tool_name = str(node.tool or "").strip()
+            if not tool_name:
+                if OutputKind.MESSAGE_SENT in produces:
+                    return ToolDecision(
+                        decision=DecisionType.RESPOND,
+                        intent=str(node.intent or f"workflow_{node.node_id}").strip() or f"workflow_{node.node_id}",
+                        reason=str(
+                            node.reason
+                            or "The workflow node is a channel reply; render it as the final response."
+                        ).strip(),
+                        risk_level=RiskLevel.LOW,
+                        overall_task_goal=goal,
+                        expected_step_outputs=produces,
+                    )
+                return None
+            if not self.registry.has_tool(tool_name):
+                return None
+            if tool_name == "qq.send_file" and not supports_message_delivery:
+                return None
+
+            arguments = self._build_contract_workflow_arguments(
+                tool_name=tool_name,
+                user_text=user_text,
+                candidate_state=candidate_state,
+                task_envelope=task_envelope,
+                tool_results=tool_results or [],
+            )
+            if tool_name == "qq.send_text" and not str(arguments.get("message") or "").strip():
+                return ToolDecision(
+                    decision=DecisionType.RESPOND,
+                    intent=str(node.intent or f"workflow_{node.node_id}").strip() or f"workflow_{node.node_id}",
+                    reason=(
+                        "The contract requested a current-channel text reply but did not provide an outbound "
+                        "message body, so the kernel should render the final response instead of calling qq.send_text."
+                    ),
+                    risk_level=RiskLevel.LOW,
+                    overall_task_goal=goal,
+                    expected_step_outputs=produces,
+                )
+            tool_name, arguments = self._adapt_contract_workflow_tool_for_grounded_target(
+                tool_name=tool_name,
+                arguments=arguments,
+                produces=produces,
+            )
+            decision = ToolDecision(
+                decision=DecisionType.TOOL_CALL,
+                intent=str(node.intent or f"workflow_{node.node_id}").strip() or f"workflow_{node.node_id}",
+                reason=str(node.reason or "Run the next node from the main agent workflow contract.").strip(),
+                selected_tool=tool_name,
+                arguments=arguments,
+                risk_level=RiskLevel.LOW,
+                overall_task_goal=goal,
+                expected_step_outputs=produces,
+            )
+            if task_envelope is not None:
+                decision, _trace = self._repair_decision_arguments_from_task_contract(
+                    decision,
+                    task_envelope=task_envelope,
+                )
+                decision, _trace = self._route_unsafe_document_write_decision(
+                    decision,
+                    task_envelope=task_envelope,
+                )
+            return decision
+        return None
+
+    def _scoped_manifests(self, task_envelope) -> list:
+        """按需返回相关工具 manifest，避免每步传全部 70+ 个工具."""
+        preferred = list(getattr(task_envelope, "preferred_tools", []) or [])
+        allowed_families = set(getattr(task_envelope, "allowed_families", []) or [])
+        if not preferred and not allowed_families:
+            return self.registry.list_manifests()
+
+        all_tools = self.registry.list_manifests()
+        scoped = []
+        for m in all_tools:
+            family = self._tool_family_for_selected_tool(m.tool_name)
+            if family in allowed_families or m.tool_name in preferred:
+                scoped.append(m)
+        # 至少保留 skill + system_utility + memory 模块（skills永远可见）
+        for m in all_tools:
+            family = self._tool_family_for_selected_tool(m.tool_name)
+            if family in {"skill", "system_utility", "memory"} and m not in scoped:
+                scoped.append(m)
+        return scoped if scoped else all_tools
+
+    @staticmethod
+    def _has_authoritative_contract_workflow(task_envelope: TaskEnvelope | None) -> bool:
+        # ReAct 模式
+        return False
+
+    @staticmethod
+    def _build_contract_blocked_decision(
+        *,
+        workflow_spec: WorkflowSpec | None,
+        overall_task_goal: TaskGoal | None,
+        completed_outputs: list[OutputKind],
+    ) -> ToolDecision | None:
+        goal = workflow_spec.goal if workflow_spec is not None and workflow_spec.goal is not None else overall_task_goal
+        missing_outputs = [
+            output
+            for output in ((goal.required_outputs if goal is not None else []) or [])
+            if output not in set(completed_outputs or [])
+        ]
+        if not missing_outputs:
+            return None
+        return ToolDecision(
+            decision=DecisionType.CLARIFY,
+            intent="contract_workflow_blocked",
+            reason=(
+                "The authoritative main-agent workflow has pending required outputs, "
+                "but no executable next node is currently available."
+            ),
+            response_hint="我已经按主任务流程推进到这里，但还缺少继续执行所需的中间结果，需要补齐后才能完成。",
+            risk_level=RiskLevel.LOW,
+            overall_task_goal=goal,
+        )
+
+    def _adapt_contract_workflow_tool_for_grounded_target(
+        self,
+        *,
+        tool_name: str,
+        arguments: dict[str, Any],
+        produces: list[OutputKind],
+    ) -> tuple[str, dict[str, Any]]:
+        if tool_name != "file.read" or OutputKind.FILE_CONTENTS not in produces:
+            return tool_name, arguments
+        if not self.registry.has_tool("file.extract_text"):
+            return tool_name, arguments
+        paths = arguments.get("paths")
+        if not isinstance(paths, list) or not paths:
+            return tool_name, arguments
+        first_path = next((str(path).strip() for path in paths if isinstance(path, str) and path.strip()), "")
+        if not first_path or not self._looks_like_document_path(first_path):
+            return tool_name, arguments
+        return (
+            "file.extract_text",
+            {
+                "paths": paths,
+                "encoding": str(arguments.get("encoding") or "utf-8"),
+                "max_chars": int(arguments.get("max_chars") or arguments.get("max_bytes") or 12000),
+                "max_rows_per_sheet": 10,
+            },
+        )
+
+    def _build_contract_workflow_arguments(
+        self,
+        *,
+        tool_name: str,
+        user_text: str,
+        candidate_state: CandidateState | None,
+        task_envelope: TaskEnvelope | None,
+        tool_results: list[ToolCallResult] | None = None,
+    ) -> dict[str, Any]:
+        grounded_inputs = self._parse_task_envelope_grounded_inputs(task_envelope)
+        subject = self._first_grounded_string(
+            grounded_inputs,
+            "resolved_subject",
+            "target_name",
+            "target",
+            "query",
+            "topic",
+            "search_query",
+        )
+        source_context = self._first_grounded_string(
+            grounded_inputs,
+            "source_context",
+            "scope",
+            "path",
+            "path_scope",
+            "directory",
+        )
+        target_path = self._first_grounded_string(
+            grounded_inputs,
+            "target_path",
+            "source_path",
+            "file_path",
+            "path",
+        )
+        if not target_path and tool_name in {"file.write", "file.read"}:
+            target_path = self._build_contract_file_path_from_subject(subject, source_context)
+        if not target_path and tool_name == "file.write_docx":
+            target_path = self._build_contract_docx_path(
+                subject=subject,
+                source_context=source_context,
+                user_text=user_text,
+            )
+        if not target_path and candidate_state is not None:
+            target_path = self._select_candidate_path_for_action(candidate_state, "read") or ""
+        instruction = self._first_grounded_string(
+            grounded_inputs,
+            "instruction",
+            "task",
+            "edit_instruction",
+            "operation",
+        ) or str(getattr(task_envelope, "primary_objective", "") or user_text or "").strip()
+        url = self._first_grounded_string(grounded_inputs, "url", "target_url", "source_url")
+        contact_query = self._first_grounded_string(
+            grounded_inputs,
+            "contact_query",
+            "contact",
+            "contact_name",
+            "person",
+            "group",
+        )
+        message = self._first_grounded_string(
+            grounded_inputs,
+            "message",
+            "text",
+            "reply_text",
+            "speech_text",
+        )
+        if tool_name in {"system.create_reminder", "system.create_scheduled_task"}:
+            message = self._infer_reminder_message_from_contract_context(
+                grounded_inputs=grounded_inputs,
+                task_envelope=task_envelope,
+                user_text=user_text,
+                fallback=instruction,
+            )
+        when_iso = self._first_grounded_string(grounded_inputs, "when_iso", "scheduled_for", "time_iso", "datetime_iso")
+        timezone_name = self._first_grounded_string(grounded_inputs, "timezone", "timezone_name", "tz")
+        if not when_iso and tool_name in {"system.create_reminder", "system.create_scheduled_task"}:
+            when_iso = self._infer_when_iso_from_contract_context(
+                grounded_inputs=grounded_inputs,
+                task_envelope=task_envelope,
+                user_text=user_text,
+                tool_results=tool_results,
+                timezone_name=timezone_name or "Asia/Shanghai",
+            )
+        session_id = self._first_grounded_string(grounded_inputs, "session_id", "target_session_id")
+        channel = self._first_grounded_string(grounded_inputs, "channel", "runtime_channel")
+        task_type = self._first_grounded_string(grounded_inputs, "task_type", "schedule_type")
+        reminder_id = self._first_grounded_string(grounded_inputs, "reminder_id", "id")
+
+        if tool_name == "memory.recall":
+            query = subject or instruction or str(getattr(task_envelope, "primary_objective", "") or user_text or "").strip()
+            return {"query": query, "limit": 5} if query else {}
+        if tool_name == "file.search_by_name":
+            args: dict[str, Any] = {}
+            if target_path:
+                args["path"] = str(Path(target_path).parent)
+                args["query"] = Path(target_path).name
+                args["query_terms"] = [Path(target_path).stem, Path(target_path).name]
+                args["extensions"] = [Path(target_path).suffix] if Path(target_path).suffix else []
+                args.setdefault("recursive", True)
+                args.setdefault("include_dirs", True)
+                args.setdefault("scope_mode", "subtree")
+                args.setdefault("target_kind", "file")
+                args.setdefault("top_k", 8)
+                return args
+            if source_context:
+                args["path"] = source_context
+            if subject:
+                args["query"] = subject
+                plan = self._build_local_retrieval_plan(subject, user_text=str(getattr(task_envelope, "primary_objective", "") or user_text))
+                if plan.get("query_terms"):
+                    args["query_terms"] = plan["query_terms"]
+                if plan.get("alias_terms"):
+                    args["alias_terms"] = plan["alias_terms"]
+                if plan.get("extensions"):
+                    args["extensions"] = plan["extensions"]
+            args.setdefault("recursive", True)
+            args.setdefault("include_dirs", True)
+            args.setdefault("scope_mode", "subtree")
+            args.setdefault("target_kind", "file")
+            args.setdefault("top_k", 8)
+            return args
+        if tool_name == "retrieval.search_local_objects":
+            args = {}
+            if source_context:
+                args["path_scope"] = source_context
+            if subject:
+                args["query"] = subject
+            args.setdefault("scope_mode", "subtree")
+            args.setdefault("target_kind", "file")
+            args.setdefault("top_k", 8)
+            args.setdefault("rebuild_if_missing", True)
+            return args
+        if tool_name == "file.list":
+            args = {}
+            if source_context:
+                args["path"] = source_context
+            args.setdefault("recursive", True)
+            args.setdefault("include_dirs", True)
+            return args
+        if tool_name == "file.metadata_many":
+            paths = self._latest_listed_image_paths(tool_results or [], source_context=source_context)
+            return {"paths": paths, "continue_on_error": True} if paths else {}
+        if tool_name == "file.mkdir_many":
+            folders = self._image_organization_folder_paths(tool_results or [], source_context=source_context)
+            return {"paths": folders, "exist_ok": True, "parents": True, "continue_on_error": True} if folders else {}
+        if tool_name in {"file.move_many", "file.copy_many"}:
+            items = self._image_organization_move_items(tool_results or [], source_context=source_context)
+            return {"items": items, "continue_on_error": True} if items else {}
+        if tool_name == "file.extract_text":
+            return {"paths": [target_path], "max_chars": 12000, "max_rows_per_sheet": 10} if target_path else {}
+        if tool_name == "file.read":
+            return {"paths": [target_path], "encoding": "utf-8", "max_bytes": 12000} if target_path else {}
+        if tool_name == "file.write":
+            content = self._first_grounded_string(
+                grounded_inputs,
+                "content",
+                "file_content",
+                "body",
+                "text",
+            ) or instruction
+            args = {"path": target_path} if target_path else {}
+            if content:
+                args["content"] = content
+            return args
+        if tool_name == "document_agent.compose":
+            if not target_path:
+                target_path = self._build_contract_docx_path(
+                    subject=subject,
+                    source_context=source_context,
+                    user_text=user_text,
+                )
+            args = {
+                "instruction": instruction,
+                "output_path": target_path,
+                "title": subject or str(getattr(task_envelope, "primary_objective", "") or "").strip(),
+                "recent_context": "",
+                "resolved_facts": {},
+                "source_materials": self._collect_document_source_materials(tool_results or []),
+                "style_hints": {},
+                "max_chars": 12000,
+            }
+            if grounded_inputs:
+                args["grounded_inputs"] = grounded_inputs
+            return args
+        if tool_name == "file.write_docx":
+            composed_content = ""
+            composed_title = None
+            composed_doc = self._latest_composed_document(tool_results or [])
+            if composed_doc:
+                composed_title = str(composed_doc.get("title") or "").strip() or None
+                composed_content = self._clean_web_document_text(str(composed_doc.get("content") or "").strip())
+                if not composed_content:
+                    files = composed_doc.get("files")
+                    if isinstance(files, list):
+                        for file_entry in files:
+                            if isinstance(file_entry, dict):
+                                composed_content = self._clean_web_document_text(str(file_entry.get("content") or "").strip())
+                                if composed_content:
+                                    break
+            elif any(
+                result.status == "success" and result.tool_name in {"web.research", "web.fetch"}
+                for result in (tool_results or [])
+            ):
+                composed_content, composed_title = self._compose_web_write_content(
+                    user_text=user_text,
+                    tool_results=tool_results or [],
+                    delivery_intent=SimpleNamespace(title=subject or None),
+                    recent_context="",
+                )
+            content = composed_content or self._first_grounded_string(
+                grounded_inputs,
+                "content",
+                "file_content",
+                "body",
+                "text",
+            ) or self._build_docx_content_from_tool_results(tool_results or []) or instruction
+            content = self._clean_web_document_text(content) or content
+            title = composed_title or subject or str(getattr(task_envelope, "primary_objective", "") or "").strip() or Path(target_path).stem
+            args = {"path": target_path} if target_path else {}
+            if title:
+                args["title"] = title
+            if content:
+                args["content"] = content
+                args["paragraphs"] = self._split_docx_paragraphs(content)
+            args["overwrite"] = True
+            return args
+        if tool_name in {"file.metadata", "file.preview", "file.open_path", "file.reveal_in_explorer", "file.delete", "image.describe", "image.inspect"}:
+            return {"path": target_path} if target_path else {}
+        if tool_name == "image.read_text":
+            return {"paths": [target_path], "max_chars": 8000} if target_path else {}
+        if tool_name in {"document_agent.summarize", "document_agent.read", "document_agent.inspect", "document_agent.edit"}:
+            args = {"source_path": target_path, "instruction": instruction} if target_path else {"instruction": instruction}
+            if grounded_inputs:
+                args["grounded_inputs"] = grounded_inputs
+            args.setdefault("recent_context", "")
+            args.setdefault("resolved_facts", {})
+            args.setdefault("source_materials", {})
+            args.setdefault("constraints", {})
+            args.setdefault("style_hints", {})
+            if tool_name == "document_agent.edit":
+                args.setdefault("allow_overwrite", True)
+                args.setdefault("preserve_structure", True)
+                args.setdefault("preserve_style", True)
+            return args
+        if tool_name in {"web.search", "web.research"}:
+            args = {"query": subject} if subject else {}
+            if tool_name == "web.research" and subject:
+                args.update({"max_results": 5, "max_pages": 2, "prefer_browser": True})
+            elif subject:
+                args.setdefault("max_results", 5)
+            return args
+        if tool_name == "web.fetch":
+            return {"url": url} if url else {}
+        if tool_name == "qq.search_history":
+            args = {"limit": 5}
+            if subject:
+                args["query"] = subject
+            if contact_query:
+                args["contact_query"] = contact_query
+            return args
+        if tool_name == "qq.get_recent_messages":
+            args = {"limit": 2, "include_assistant": True}
+            if session_id:
+                args["session_id"] = session_id
+            return args
+        if tool_name == "qq.search_contacts":
+            return {"query": contact_query or subject, "target_kind": "any", "limit": 5} if (contact_query or subject) else {}
+        if tool_name in {"qq.get_current_context", "qq.get_last_reply"}:
+            return {}
+        if tool_name == "qq.get_recent_attachments":
+            args = {"kind": "any", "limit": 5}
+            if contact_query:
+                args["contact_query"] = contact_query
+            return args
+        if tool_name == "qq.send_text":
+            return {"message": message, "target_kind": "current"} if message else {"target_kind": "current"}
+        if tool_name == "qq.send_file":
+            return {"file_path": target_path, "target_kind": "current"} if target_path else {"target_kind": "current"}
+        if tool_name == "qq.send_voice":
+            return {"speech_text": message, "target_kind": "current"} if message else {"target_kind": "current"}
+        if tool_name == "system.get_time":
+            kind = self._first_grounded_string(grounded_inputs, "kind", "time_kind") or "datetime"
+            args = {"kind": kind}
+            if timezone_name:
+                args["timezone_name"] = timezone_name
+            return args
+        if tool_name == "system.create_reminder":
+            task_payload = grounded_inputs.get("task_payload")
+            args = {
+                "when_iso": when_iso,
+                "timezone": timezone_name or "Asia/Shanghai",
+                "message": message or instruction,
+                "task_payload": self._ensure_cached_reminder_payload(task_payload, message or instruction),
+            }
+            if session_id:
+                args["session_id"] = session_id
+            if channel:
+                args["channel"] = channel
+            return {key: value for key, value in args.items() if value not in (None, "")}
+        if tool_name == "system.create_scheduled_task":
+            task_payload = grounded_inputs.get("task_payload")
+            args = {
+                "task_type": task_type or "notify",
+                "when_iso": when_iso,
+                "timezone": timezone_name or "Asia/Shanghai",
+                "message": message or instruction,
+                "task_payload": self._ensure_cached_reminder_payload(task_payload, message or instruction)
+                if (task_type or "notify") == "notify"
+                else (task_payload if isinstance(task_payload, dict) else {}),
+            }
+            if session_id:
+                args["session_id"] = session_id
+            if channel:
+                args["channel"] = channel
+            return {key: value for key, value in args.items() if value not in (None, "")}
+        if tool_name == "system.list_reminders":
+            args = {"status": self._first_grounded_string(grounded_inputs, "status") or "scheduled"}
+            if session_id:
+                args["session_id"] = session_id
+            return args
+        if tool_name == "system.cancel_reminder":
+            return {"reminder_id": reminder_id} if reminder_id else {}
+        return {}
+
+    _IMAGE_ORGANIZATION_EXTENSIONS = {
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".gif",
+        ".bmp",
+        ".webp",
+        ".heic",
+        ".tif",
+        ".tiff",
+    }
+
+    @classmethod
+    def _is_image_file_path(cls, path: str) -> bool:
+        try:
+            return Path(path).suffix.lower() in cls._IMAGE_ORGANIZATION_EXTENSIONS
+        except Exception:
+            return False
+
+    @classmethod
+    def _latest_listed_image_paths(
+        cls,
+        tool_results: list[ToolCallResult],
+        *,
+        source_context: str | None = None,
+        limit: int = 300,
+    ) -> list[str]:
+        source_root = Path(source_context).resolve() if source_context else None
+        for result in reversed(tool_results):
+            if result.status != "success" or result.tool_name != "file.list":
+                continue
+            entries = result.data.get("entries", [])
+            paths: list[str] = []
+            for entry in entries:
+                if not isinstance(entry, dict) or bool(entry.get("is_dir")):
+                    continue
+                raw_path = str(entry.get("path") or "").strip()
+                if not raw_path or not cls._is_image_file_path(raw_path):
+                    continue
+                path = Path(raw_path)
+                if source_root is not None:
+                    try:
+                        path.resolve().relative_to(source_root)
+                    except Exception:
+                        continue
+                paths.append(str(path))
+                if len(paths) >= limit:
+                    break
+            if paths:
+                return paths
+        return []
+
+    @classmethod
+    def _latest_image_metadata_items(cls, tool_results: list[ToolCallResult]) -> list[dict[str, Any]]:
+        for result in reversed(tool_results):
+            if result.status != "success" or result.tool_name != "file.metadata_many":
+                continue
+            raw_items = result.data.get("items") or result.data.get("results") or []
+            items: list[dict[str, Any]] = []
+            for item in raw_items:
+                if not isinstance(item, dict) or not bool(item.get("ok", True)):
+                    continue
+                path = str(item.get("path") or "").strip()
+                if path and cls._is_image_file_path(path):
+                    items.append(item)
+            if items:
+                return items
+        return []
+
+    @staticmethod
+    def _image_group_from_metadata(item: dict[str, Any]) -> str:
+        raw_modified = item.get("modified_at")
+        try:
+            modified = datetime.fromtimestamp(float(raw_modified))
+            return modified.strftime("%Y-%m")
+        except Exception:
+            return "未分类"
+
+    @classmethod
+    def _image_organization_destination_root(
+        cls,
+        metadata_items: list[dict[str, Any]],
+        *,
+        source_context: str | None = None,
+    ) -> Path | None:
+        if source_context:
+            return Path(source_context) / "图片整理"
+        for item in metadata_items:
+            path = str(item.get("path") or "").strip()
+            if path:
+                return Path(path).parent / "图片整理"
+        return None
+
+    @classmethod
+    def _image_organization_folder_paths(
+        cls,
+        tool_results: list[ToolCallResult],
+        *,
+        source_context: str | None = None,
+    ) -> list[str]:
+        metadata_items = cls._latest_image_metadata_items(tool_results)
+        if not metadata_items:
+            # 没有 metadata 时，用 file.list 结果推断
+            paths = cls._latest_listed_image_paths(tool_results, source_context=source_context)
+            if not paths:
+                return []
+            from datetime import datetime as _dt
+            group = _dt.now().strftime("%Y-%m")
+            if source_context:
+                dest_root = Path(source_context) / "图片整理"
+            else:
+                dest_root = Path(paths[0]).parent / "图片整理"
+            return [str(dest_root / group)]
+        destination_root = cls._image_organization_destination_root(metadata_items, source_context=source_context)
+        if destination_root is None:
+            return []
+        groups = sorted({cls._image_group_from_metadata(item) for item in metadata_items})
+        return [str(destination_root / group) for group in groups]
+
+    @classmethod
+    def _image_organization_move_items(
+        cls,
+        tool_results: list[ToolCallResult],
+        *,
+        source_context: str | None = None,
+    ) -> list[dict[str, Any]]:
+        metadata_items = cls._latest_image_metadata_items(tool_results)
+        if not metadata_items:
+            # 没有 metadata 结果时，直接用 file.list 的图片路径
+            paths = cls._latest_listed_image_paths(tool_results, source_context=source_context)
+            if not paths:
+                return []
+            # 用当前时间做简单分组
+            from datetime import datetime as _dt
+            group = _dt.now().strftime("%Y-%m")
+            if source_context:
+                dest_root = Path(source_context) / "图片整理"
+            else:
+                dest_root = Path(paths[0]).parent / "图片整理"
+            return [
+                {
+                    "src_path": p,
+                    "dest_path": str(dest_root / group / Path(p).name),
+                    "overwrite": False,
+                }
+                for p in paths
+            ]
+        destination_root = cls._image_organization_destination_root(metadata_items, source_context=source_context)
+        if destination_root is None:
+            return []
+        items: list[dict[str, Any]] = []
+        for item in metadata_items:
+            src = Path(str(item.get("path") or "").strip())
+            if not src.name:
+                continue
+            try:
+                src.resolve().relative_to(destination_root.resolve())
+                continue
+            except Exception:
+                pass
+            group = cls._image_group_from_metadata(item)
+            items.append(
+                {
+                    "src_path": str(src),
+                    "dest_path": str(destination_root / group / src.name),
+                    "overwrite": False,
+                }
+            )
+        return items
+
+    @staticmethod
+    def _build_contract_workflow_debug_payload(
+        *,
+        workflow_spec: WorkflowSpec | None,
+        completed_outputs: list[OutputKind],
+        candidate_state: CandidateState | None = None,
+        observed_workflow_state: WorkflowState | None = None,
+        active_overall_goal: TaskGoal | None = None,
+        selected_decision: ToolDecision | None = None,
+    ) -> dict[str, Any]:
+        completed_values = [
+            output.value if isinstance(output, OutputKind) else str(output)
+            for output in completed_outputs
+        ]
+        completed_set = set(completed_outputs)
+        nodes: list[dict[str, Any]] = []
+        next_node_id: str | None = None
+        blocked_by: list[str] = []
+        selected_node_id: str | None = None
+        selected_outputs = set(getattr(selected_decision, "expected_step_outputs", []) or [])
+        selected_tool = str(getattr(selected_decision, "selected_tool", "") or "").strip()
+
+        if workflow_spec is not None:
+            for node in workflow_spec.nodes:
+                produces = [output for output in node.produces if isinstance(output, OutputKind)]
+                requires = [output for output in node.requires if isinstance(output, OutputKind)]
+                missing_requires = [output for output in requires if output not in completed_set]
+                missing_produces = [output for output in produces if output not in completed_set]
+                if produces and not missing_produces:
+                    status = "completed"
+                elif missing_requires:
+                    status = "blocked"
+                else:
+                    status = "ready"
+                    if next_node_id is None:
+                        next_node_id = node.node_id
+                if selected_node_id is None and selected_tool and node.tool == selected_tool:
+                    if not selected_outputs or selected_outputs == set(produces):
+                        selected_node_id = node.node_id
+                if status == "blocked" and next_node_id is None:
+                    blocked_by = [output.value for output in missing_requires]
+
+                nodes.append(
+                    {
+                        "node_id": node.node_id,
+                        "tool": node.tool,
+                        "intent": node.intent,
+                        "status": status,
+                        "requires": [output.value for output in requires],
+                        "produces": [output.value for output in produces],
+                        "missing_requires": [output.value for output in missing_requires],
+                        "missing_outputs": [output.value for output in missing_produces],
+                    }
+                )
+
+        required_outputs = []
+        if active_overall_goal is not None:
+            required_outputs = [
+                output.value if isinstance(output, OutputKind) else str(output)
+                for output in active_overall_goal.required_outputs
+            ]
+        missing_outputs = [output for output in required_outputs if output not in completed_values]
+        return {
+            "workflow_name": None if workflow_spec is None else workflow_spec.workflow_name,
+            "goal": None if workflow_spec is None or workflow_spec.goal is None else workflow_spec.goal.model_dump(mode="json"),
+            "nodes": nodes,
+            "node_count": len(nodes),
+            "next_node_id": next_node_id,
+            "selected_node_id": selected_node_id,
+            "selected_tool": selected_tool or None,
+            "selected_decision": None if selected_decision is None else selected_decision.model_dump(mode="json"),
+            "blocked_by": blocked_by,
+            "completed_outputs": completed_values,
+            "required_outputs": required_outputs,
+            "missing_outputs": missing_outputs,
+            "candidate_state": None if candidate_state is None else candidate_state.model_dump(mode="json"),
+            "observed_workflow_state": None if observed_workflow_state is None else observed_workflow_state.model_dump(mode="json"),
+        }
 
     @staticmethod
     def _infer_goal_driven_candidate_action(
@@ -2260,9 +4376,7 @@ class AgentKernel:
         ]
         if OutputKind.FILE_WRITTEN in missing_outputs:
             if OutputKind.OBJECT_DETAILS not in completed_outputs:
-                if AgentKernel._looks_like_document_block_search_request(user_text):
-                    return "search_document_blocks"
-                return "extract_document_structure"
+                return "inspect"
             return None
         if OutputKind.FILE_CONTENTS in missing_outputs:
             if AgentKernel._looks_like_image_text_request(user_text):
@@ -2271,13 +4385,9 @@ class AgentKernel:
         if OutputKind.OBJECT_DETAILS in missing_outputs:
             if AgentKernel._looks_like_image_request(user_text):
                 return "describe_image"
-            if AgentKernel._looks_like_document_block_search_request(user_text):
-                return "search_document_blocks"
-            if AgentKernel._looks_like_document_structure_request(user_text) or OutputKind.FILE_WRITTEN in missing_outputs:
-                return "extract_document_structure"
             if AgentKernel._looks_like_preview_request(user_text):
                 return "preview"
-            return "metadata"
+            return "inspect"
         if OutputKind.MESSAGE_SENT in missing_outputs:
             if supports_message_delivery:
                 return "send_file"
@@ -2443,7 +4553,7 @@ class AgentKernel:
     @staticmethod
     def _finalize_local_lookup_query(cleaned: str) -> str:
         cleaned = str(cleaned or "")
-        cleaned = re.sub("[,.!?:;()\\[\\]{}\"'`?????????????]+", " ", cleaned)
+        cleaned = re.sub(r"[,.!?:;，。！？：；、（）()《》【】\[\]{}\"'`]+", " ", cleaned)
         cleaned = re.sub(
             r"\b(send|attach|upload|deliver|it|me|the|to|open|show|find|search|look|check)\b",
             " ",
@@ -2503,43 +4613,39 @@ class AgentKernel:
     @classmethod
     def _local_file_extensions_for_query(cls, query: str, *, user_text: str = "") -> list[str]:
         lowered = f"{query} {user_text}".lower()
-        if any(
-            token in lowered
-            for token in ("png", "jpg", "jpeg", "webp", "gif", "bmp", "图片", "照片", "截图", "图像", "image", "picture", "photo", "screenshot")
-        ):
-            return [".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"]
-        if any(token in lowered for token in ("ppt", "presentation", ".pptx", "幻灯片", "演示")):
+        explicit_exts = [
+            ext
+            for ext in (".docx", ".pptx", ".xlsx", ".md", ".txt", ".pdf", ".log", ".csv", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp")
+            if ext in lowered
+        ]
+        if explicit_exts:
+            return cls._dedupe_preserve_order(explicit_exts)
+        if re.search(r"(?<![a-z0-9])(?:ppt|powerpoint|presentation)(?![a-z0-9])", lowered):
             return [".pptx"]
-        if any(token in lowered for token in ("excel", "sheet", "spreadsheet", ".xlsx", "表格")):
+        if re.search(r"(?<![a-z0-9])(?:excel|sheet|spreadsheet)(?![a-z0-9])", lowered):
             return [".xlsx", ".csv"]
-        if any(token in lowered for token in ("word", ".docx", "文档")):
+        if re.search(r"(?<![a-z0-9])(?:word|docx?)(?![a-z0-9])", lowered):
             return [".docx"]
-        if any(token in lowered for token in ("markdown", ".md")):
+        if re.search(r"(?<![a-z0-9])(?:markdown|md)(?![a-z0-9])", lowered):
             return [".md"]
-        if ".pdf" in lowered or re.search(r"(?<![a-z0-9])pdf(?![a-z0-9])", lowered):
+        if re.search(r"(?<![a-z0-9])pdf(?![a-z0-9])", lowered):
             return [".pdf"]
-        if ".txt" in lowered or "文本文档" in lowered or re.search(r"(?<![a-z0-9])txt(?![a-z0-9])", lowered):
+        if re.search(r"(?<![a-z0-9])txt(?![a-z0-9])", lowered):
             return [".txt"]
-        if ".log" in lowered or "日志文件" in lowered or "日志格式" in lowered or "log file" in lowered:
+        if re.search(r"(?<![a-z0-9])log file(?![a-z0-9])", lowered):
             return [".log"]
         return []
 
     @classmethod
     def _build_local_retrieval_plan(cls, query: str, *, user_text: str = "") -> dict[str, object]:
-        normalized = FileQueryNormalizer.normalize(query)
-        extensions = list(normalized.file_type_hints) or cls._local_file_extensions_for_query(query, user_text=user_text)
-        planned_query = FileQueryNormalizer.strip_file_type_terms(query, extensions) or query
-        tokenized_query = cls._tokenize_query(planned_query)
-        if normalized.core_terms:
-            query_terms = cls._dedupe_preserve_order(list(normalized.core_terms))
-            if any("." in term or re.search(r"\d{4,}", term) for term in tokenized_query):
-                query_terms = cls._dedupe_preserve_order([*tokenized_query, *query_terms])
-        else:
-            query_terms = cls._dedupe_preserve_order(tokenized_query)
+        extensions = cls._local_file_extensions_for_query(query, user_text=user_text)
+        planned_query = FileQueryNormalizer.strip_file_type_terms(query, extensions) if extensions else query
+        planned_query = planned_query or query
+        query_terms = cls._dedupe_preserve_order(cls._tokenize_query(planned_query))
         return {
             "query": planned_query,
             "query_terms": query_terms or cls._tokenize_query(planned_query),
-            "alias_terms": normalized.alias_terms,
+            "alias_terms": [],
             "extensions": extensions,
             "type_constraints": extensions,
         }
@@ -2756,29 +4862,6 @@ class AgentKernel:
             cleaned = re.sub(re.escape(phrase), " ", cleaned, flags=re.IGNORECASE)
         return AgentKernel._finalize_local_lookup_query(cleaned)
 
-    @classmethod
-    def _build_file_delivery_workflow(
-        cls,
-        user_text: str,
-        completed_outputs: list[OutputKind],
-        candidate_state: CandidateState | None,
-        overall_task_goal: TaskGoal | None,
-        knowledge_intent=None,
-        task_classification=None,
-        *,
-        supports_message_delivery: bool = False,
-    ) -> ToolDecision | None:
-        classified_kind = "" if task_classification is None else str(getattr(task_classification, "task_kind", "") or "").strip().lower()
-        preferred_families = cls._classification_preferred_families(task_classification)
-        if classified_kind != "delivery" and "file_delivery" not in preferred_families:
-            return None
-        knowledge_type = "" if knowledge_intent is None else str(getattr(knowledge_intent, "knowledge_type", "") or "")
-        if knowledge_type and knowledge_type != "local_workspace":
-            return None
-        if candidate_state is None or not candidate_state.candidate_paths:
-            return None
-        return None
-
     def _build_llm_local_search_workflow(
         self,
         *,
@@ -2810,13 +4893,7 @@ class AgentKernel:
             if prior_source_tool == "retrieval.search_local_objects":
                 return None
         if not hasattr(self.llm_client, "plan_local_search_step"):
-            return self._build_legacy_initial_local_search_workflow(
-                user_text=user_text,
-                candidate_state=candidate_state,
-                task_classification=task_classification,
-                overall_task_goal=overall_task_goal,
-                supports_message_delivery=supports_message_delivery,
-            )
+            return None
 
         task_kind = "" if task_classification is None else str(getattr(task_classification, "task_kind", "") or "").strip().lower()
         planner_family = "local_lookup"
@@ -2900,24 +4977,12 @@ class AgentKernel:
                 active_task_summary=self.active_task_summary,
             )
         except Exception:
-            return self._build_legacy_initial_local_search_workflow(
-                user_text=user_text,
-                candidate_state=candidate_state,
-                task_classification=task_classification,
-                overall_task_goal=overall_task_goal,
-                supports_message_delivery=supports_message_delivery,
-            )
+            return None
 
         selected_tool = str(plan.get("selected_tool", "") or "").strip()
         arguments = plan.get("arguments", {})
         if selected_tool not in set(allowed_tools) or not isinstance(arguments, dict):
-            return self._build_legacy_initial_local_search_workflow(
-                user_text=user_text,
-                candidate_state=candidate_state,
-                task_classification=task_classification,
-                overall_task_goal=overall_task_goal,
-                supports_message_delivery=supports_message_delivery,
-            )
+            return None
 
         normalized_arguments = dict(arguments)
         if selected_tool == "file.list":
@@ -2965,13 +5030,7 @@ class AgentKernel:
                 normalized_arguments["extensions"] = preferred_extensions
             expected_outputs = [OutputKind.OBJECT_CANDIDATES]
         else:
-            return self._build_legacy_initial_local_search_workflow(
-                user_text=user_text,
-                candidate_state=candidate_state,
-                task_classification=task_classification,
-                overall_task_goal=overall_task_goal,
-                supports_message_delivery=supports_message_delivery,
-            )
+            return None
 
         return ToolDecision(
             decision=DecisionType.TOOL_CALL,
@@ -2995,145 +5054,6 @@ class AgentKernel:
         if task_kind == "delivery":
             return "file_delivery"
         return "local_lookup"
-
-    @classmethod
-    def _build_legacy_initial_local_search_workflow(
-        cls,
-        *,
-        user_text: str,
-        candidate_state: CandidateState | None = None,
-        task_classification=None,
-        overall_task_goal: TaskGoal | None,
-        supports_message_delivery: bool = False,
-    ) -> ToolDecision | None:
-        task_kind = "" if task_classification is None else str(getattr(task_classification, "task_kind", "") or "").strip().lower()
-        prior_source_tool = ""
-        if candidate_state is not None and not candidate_state.candidate_paths:
-            prior_source_tool = str(candidate_state.source_tool or "").strip()
-            if prior_source_tool == "retrieval.search_local_objects":
-                return None
-
-        if task_kind in {"document_edit", "edit", "rewrite", "transform"}:
-            query = cls._extract_document_lookup_query(user_text)
-            default_summary = f"Find the local document matching {query} before continuing the requested document operation."
-            intent_by_name = "search_document_operation_candidates_by_name"
-            intent_hybrid = "search_document_operation_candidates"
-        elif task_kind in {"summarize", "document_summary"}:
-            query = cls._extract_document_lookup_query(user_text)
-            default_summary = f"Find and summarize the document matching {query}."
-            intent_by_name = "search_document_candidates_by_name"
-            intent_hybrid = "search_document_candidates"
-        elif task_kind == "delivery":
-            query = cls._extract_file_delivery_query_clean(user_text)
-            if cls._looks_like_document_summary_request(user_text):
-                document_query = cls._extract_document_lookup_query(user_text)
-                if document_query:
-                    query = document_query
-            default_summary = f"Find the local file matching {query} so it can be sent back to the user."
-            intent_by_name = "search_file_for_delivery_by_name"
-            intent_hybrid = "search_file_for_delivery"
-        else:
-            if cls._looks_like_image_request(user_text):
-                query = cls._extract_image_lookup_query(user_text)
-            else:
-                query = cls._extract_document_lookup_query(user_text)
-                if not query and cls._looks_like_file_delivery_request_clean(user_text):
-                    query = cls._extract_file_delivery_query_clean(user_text)
-            default_summary = f"Find the local file matching {query}."
-            intent_by_name = "search_local_file_candidates_by_name"
-            intent_hybrid = "search_local_file_candidates"
-
-        if not query:
-            return None
-
-        query = re.sub(r"^(找找|找一下|查找|找到)\s*", "", str(query).strip())
-        retrieval_plan = cls._build_local_retrieval_plan(query, user_text=user_text)
-        query = str(retrieval_plan["query"])
-        query_terms = list(retrieval_plan["query_terms"])
-        alias_terms = list(retrieval_plan["alias_terms"])
-        extensions = list(retrieval_plan["extensions"])
-        if task_kind in {"document_edit", "edit", "rewrite", "transform"} and ".docx" not in extensions:
-            extensions = [*extensions, ".docx"]
-
-        goal = cls._compose_local_task_goal(
-            user_text=user_text,
-            default_summary=default_summary,
-            overall_task_goal=overall_task_goal,
-            include_candidates=True,
-            supports_message_delivery=supports_message_delivery,
-            task_classification=task_classification,
-        )
-        if task_kind == "delivery" and supports_message_delivery and OutputKind.MESSAGE_SENT not in goal.required_outputs:
-            goal.required_outputs.append(OutputKind.MESSAGE_SENT)
-
-        if prior_source_tool == "file.search_by_name":
-            return ToolDecision(
-                decision=DecisionType.TOOL_CALL,
-                intent=intent_hybrid,
-                reason="Fallback heuristic broadens to hybrid local retrieval after an empty name lookup.",
-                selected_tool="retrieval.search_local_objects",
-                arguments={
-                    "query": query,
-                    "target_kind": "file",
-                    "path_scope": cls._preferred_local_path_scope(user_text),
-                    "scope_mode": cls._preferred_local_scope_mode(user_text),
-                    "extensions": extensions,
-                    "query_terms": query_terms,
-                    "alias_terms": alias_terms,
-                    "top_k": 8,
-                    "rebuild_if_missing": True,
-                },
-                risk_level=RiskLevel.LOW,
-                overall_task_goal=goal,
-                expected_step_outputs=[OutputKind.OBJECT_CANDIDATES],
-            )
-
-        if cls._looks_like_title_first_local_request(
-            user_text,
-            query,
-        ) and cls._should_keep_name_first_with_type_constraints(user_text, query, extensions):
-            return ToolDecision(
-                decision=DecisionType.TOOL_CALL,
-                intent=intent_by_name,
-                reason="Fallback heuristic chose direct file-name matching before broader local retrieval.",
-                selected_tool="file.search_by_name",
-                arguments={
-                    "path": cls._preferred_local_path_scope(user_text),
-                    "query": query,
-                    "query_terms": query_terms,
-                    "alias_terms": alias_terms,
-                    "recursive": True,
-                    "scope_mode": cls._preferred_local_scope_mode(user_text),
-                    "target_kind": "file",
-                    "extensions": extensions,
-                    "include_dirs": True,
-                    "top_k": 8,
-                },
-                risk_level=RiskLevel.LOW,
-                overall_task_goal=goal,
-                expected_step_outputs=[OutputKind.OBJECT_CANDIDATES],
-            )
-
-        return ToolDecision(
-            decision=DecisionType.TOOL_CALL,
-            intent=intent_hybrid,
-            reason="Fallback heuristic chose hybrid local retrieval for the initial search step.",
-            selected_tool="retrieval.search_local_objects",
-            arguments={
-                "query": query,
-                "target_kind": "file",
-                "path_scope": cls._preferred_local_path_scope(user_text),
-                "scope_mode": cls._preferred_local_scope_mode(user_text),
-                "extensions": extensions,
-                "query_terms": query_terms,
-                "alias_terms": alias_terms,
-                "top_k": 8,
-                "rebuild_if_missing": True,
-            },
-            risk_level=RiskLevel.LOW,
-            overall_task_goal=goal,
-            expected_step_outputs=[OutputKind.OBJECT_CANDIDATES],
-        )
 
     @classmethod
     def _build_local_file_lookup_workflow(
@@ -3162,111 +5082,6 @@ class AgentKernel:
             return explicit_image_decision
         return None
 
-        if cls._looks_like_image_request(user_text):
-            cleaned = cls._extract_image_lookup_query(user_text)
-        else:
-            cleaned = cls._extract_document_lookup_query(user_text)
-            if not cleaned and cls._looks_like_file_delivery_request_clean(user_text):
-                cleaned = cls._extract_file_delivery_query_clean(user_text)
-        if not cleaned:
-            return None
-        cleaned = re.sub(r"^(找找|找一下|查找|找到)\s*", "", cleaned)
-
-        retrieval_plan = cls._build_local_retrieval_plan(cleaned, user_text=user_text)
-        cleaned = str(retrieval_plan["query"])
-        query_terms = list(retrieval_plan["query_terms"])
-        alias_terms = list(retrieval_plan["alias_terms"])
-        extensions = list(retrieval_plan["extensions"])
-        if candidate_state is not None and not candidate_state.candidate_paths:
-            if candidate_state.source_tool == "retrieval.search_local_objects":
-                return None
-            if candidate_state.source_tool == "file.search_by_name":
-                return ToolDecision(
-                    decision=DecisionType.TOOL_CALL,
-                    intent="search_local_file_candidates",
-                    reason="Name lookup was empty, so broaden to hybrid semantic and title retrieval inside the current scope.",
-                    selected_tool="retrieval.search_local_objects",
-                    arguments={
-                        "query": cleaned,
-                        "target_kind": "file",
-                        "path_scope": cls._preferred_local_path_scope(user_text),
-                        "scope_mode": cls._preferred_local_scope_mode(user_text),
-                        "extensions": extensions,
-                        "query_terms": query_terms,
-                        "alias_terms": alias_terms,
-                        "top_k": 8,
-                        "rebuild_if_missing": True,
-                    },
-                    risk_level=RiskLevel.LOW,
-                    overall_task_goal=cls._compose_local_task_goal(
-                        user_text=user_text,
-                        default_summary=f"Find the local file matching {cleaned}.",
-                        overall_task_goal=overall_task_goal,
-                        include_candidates=True,
-                        task_classification=task_classification,
-                    ),
-                    expected_step_outputs=[OutputKind.OBJECT_CANDIDATES],
-                )
-        if cls._looks_like_title_first_local_request(
-            user_text,
-            cleaned,
-        ) and cls._should_keep_name_first_with_type_constraints(user_text, cleaned, extensions):
-            return ToolDecision(
-                decision=DecisionType.TOOL_CALL,
-                intent="search_local_file_candidates_by_name",
-                reason="This local request sounds title-like, so direct file-name matching should run before broader retrieval.",
-                selected_tool="file.search_by_name",
-                arguments={
-                    "path": cls._preferred_local_path_scope(user_text),
-                    "query": cleaned,
-                    "query_terms": query_terms,
-                    "alias_terms": alias_terms,
-                    "recursive": True,
-                    "scope_mode": cls._preferred_local_scope_mode(user_text),
-                    "target_kind": "file",
-                    "extensions": extensions,
-                    "include_dirs": True,
-                    "top_k": 8,
-                },
-                risk_level=RiskLevel.LOW,
-                overall_task_goal=cls._compose_local_task_goal(
-                    user_text=user_text,
-                    default_summary=f"Find the local file matching {cleaned}.",
-                    overall_task_goal=overall_task_goal,
-                    include_candidates=True,
-                    task_classification=task_classification,
-                ),
-                expected_step_outputs=[OutputKind.OBJECT_CANDIDATES],
-            )
-
-        return ToolDecision(
-            decision=DecisionType.TOOL_CALL,
-            intent="search_local_file_candidates",
-            reason="This looks like a local file lookup, so use the same hybrid local retrieval path as the WebUI.",
-            selected_tool="retrieval.search_local_objects",
-            arguments={
-                "query": cleaned,
-                "target_kind": "file",
-                "path_scope": cls._preferred_local_path_scope(user_text),
-                "scope_mode": cls._preferred_local_scope_mode(user_text),
-                "extensions": extensions,
-                "query_terms": query_terms,
-                "alias_terms": alias_terms,
-                "top_k": 8,
-                "rebuild_if_missing": True,
-            },
-            risk_level=RiskLevel.LOW,
-            overall_task_goal=cls._compose_local_task_goal(
-                user_text=user_text,
-                default_summary=f"Find the local file matching {cleaned}.",
-                overall_task_goal=overall_task_goal,
-                include_candidates=True,
-                task_classification=task_classification,
-            ),
-            expected_step_outputs=[OutputKind.OBJECT_CANDIDATES],
-        )
-
-
     @classmethod
     def _preferred_local_path_scope(cls, user_text: str) -> str:
         resolved_scope = infer_scope_root(
@@ -3283,40 +5098,6 @@ class AgentKernel:
         if ("桌面" in user_text or "desktop" in lowered) and "testing" not in lowered and "测试" not in user_text:
             return "shallow_first"
         return "subtree"
-
-    @classmethod
-    def _looks_like_title_first_local_request(cls, user_text: str, query: str) -> bool:
-        lowered = f"{user_text} {query}".lower()
-        title_markers = (
-            "模板",
-            "template",
-            "栏目",
-            "结构",
-            "年份",
-            "year",
-            "表格",
-            "excel",
-            "自测",
-        )
-        if any(marker in lowered for marker in title_markers):
-            return True
-        if cls._looks_like_image_request(user_text):
-            query_terms = cls._tokenize_query(query)
-            return any("." in term for term in query_terms) or any(re.search(r"\d{4,}", term) for term in query_terms)
-        query_terms = cls._tokenize_query(query)
-        year_context_markers = ("模板", "template", "汇报", "报告", "表格", "excel", "文档", "文件")
-        return any(marker in lowered for marker in year_context_markers) and len(query_terms) <= 6 and any(
-            term.isdigit() or re.fullmatch(r"20\d{2}", term) for term in query_terms
-        )
-
-    @classmethod
-    def _should_keep_name_first_with_type_constraints(cls, user_text: str, query: str, extensions: list[str]) -> bool:
-        if not extensions:
-            return True
-        if cls._looks_like_image_request(user_text):
-            query_terms = cls._tokenize_query(query)
-            return any("." in term for term in query_terms) or any(re.search(r"\d{4,}", term) for term in query_terms)
-        return False
 
     @classmethod
     def _build_web_target_workflow(
@@ -4094,6 +5875,36 @@ class AgentKernel:
         )
 
     @staticmethod
+    def _looks_like_tool_observation_text(text: str) -> bool:
+        compact = str(text or "").strip()
+        if not compact:
+            return False
+        return bool(re.match(r"^req_[0-9a-f]+\s+\w+\.", compact)) or " results_sample=" in compact
+
+    @staticmethod
+    def _looks_like_mojibake_text(text: str) -> bool:
+        sample = str(text or "")[:400]
+        if not sample:
+            return False
+        markers = ("å", "æ", "ç", "ä", "è", "é", "Â", "¤", "", "", "", "")
+        marker_count = sum(sample.count(marker) for marker in markers)
+        return marker_count >= 8
+
+    @classmethod
+    def _clean_web_document_text(cls, text: str) -> str:
+        lines: list[str] = []
+        for raw_line in str(text or "").splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            if cls._looks_like_tool_observation_text(line):
+                continue
+            if cls._looks_like_mojibake_text(line):
+                continue
+            lines.append(line)
+        return "\n\n".join(lines).strip()
+
+    @staticmethod
     def _latest_web_research_bundle(tool_results: list[ToolCallResult]) -> dict[str, Any] | None:
         for result in reversed(tool_results):
             if result.status == "success" and result.tool_name in {"web.research", "web.fetch"}:
@@ -4101,14 +5912,49 @@ class AgentKernel:
         return None
 
     @staticmethod
+    def _latest_composed_document(tool_results: list[ToolCallResult]) -> dict[str, Any] | None:
+        for result in reversed(tool_results):
+            if result.status == "success" and result.tool_name == "document_agent.compose":
+                return result.data
+        return None
+
+    @staticmethod
+    def _collect_document_source_materials(tool_results: list[ToolCallResult]) -> dict[str, Any]:
+        materials: dict[str, Any] = {}
+        tool_result_entries: list[dict[str, Any]] = []
+        for result in tool_results:
+            if result.status != "success":
+                continue
+            entry = {
+                "tool_name": result.tool_name,
+                "data": result.data,
+                "produced_outputs": [output.value for output in result.produced_outputs],
+            }
+            tool_result_entries.append(entry)
+            if result.tool_name == "web.research":
+                materials["research_bundle"] = result.data
+            elif result.tool_name == "web.fetch" and "research_bundle" not in materials:
+                materials["web_result"] = result.data
+            elif result.tool_name and result.tool_name.startswith("file."):
+                materials.setdefault("file_results", []).append(result.data)
+        if tool_result_entries:
+            materials["tool_results"] = tool_result_entries
+        return materials
+
+    @staticmethod
     def _latest_web_write_content(tool_results: list[ToolCallResult]) -> str:
         for result in reversed(tool_results):
             if result.status != "success":
                 continue
             if result.tool_name == "web.research":
+                summary = result.data.get("summary")
+                if isinstance(summary, str) and summary.strip():
+                    return AgentKernel._clean_web_document_text(summary)
                 content = result.data.get("content")
                 if isinstance(content, str) and content.strip():
-                    return content.strip()
+                    cleaned_content = AgentKernel._clean_web_document_text(content)
+                    if cleaned_content:
+                        return cleaned_content
                 snippets: list[str] = []
                 for item in result.data.get("sources", [])[:3]:
                     if not isinstance(item, dict):
@@ -4117,6 +5963,7 @@ class AgentKernel:
                     url = str(item.get("url", "")).strip()
                     excerpt = str(item.get("excerpt", "") or item.get("content", "")).strip()
                     line = "\n".join(part for part in (title, url, excerpt) if part)
+                    line = AgentKernel._clean_web_document_text(line)
                     if line:
                         snippets.append(line)
                 if snippets:
@@ -4124,7 +5971,7 @@ class AgentKernel:
             if result.tool_name == "web.fetch":
                 content = result.data.get("content")
                 if isinstance(content, str) and content.strip():
-                    return content.strip()
+                    return AgentKernel._clean_web_document_text(content)
         return ""
 
     def _compose_web_write_content(
@@ -4134,13 +5981,14 @@ class AgentKernel:
         tool_results: list[ToolCallResult],
         delivery_intent,
         recent_context: str = "",
-    ) -> tuple[str, str | None]:
+        ) -> tuple[str, str | None]:
         fallback_content = self._latest_web_write_content(tool_results)
         bundle = self._latest_web_research_bundle(tool_results)
-        if bundle is None or not hasattr(self.llm_client, "compose_web_research_document"):
+        llm_client = getattr(self, "llm_client", None)
+        if bundle is None or not hasattr(llm_client, "compose_web_research_document"):
             return fallback_content, None
         try:
-            composed = self.llm_client.compose_web_research_document(
+            composed = llm_client.compose_web_research_document(
                 user_text=user_text,
                 title=None if delivery_intent is None else getattr(delivery_intent, "title", None),
                 research_bundle=bundle,
@@ -4152,7 +6000,7 @@ class AgentKernel:
             )
         except Exception:  # noqa: BLE001
             return fallback_content, None
-        content = str(composed.get("content") or "").strip()
+        content = self._clean_web_document_text(str(composed.get("content") or "").strip())
         title = str(composed.get("title") or "").strip() or None
         return (content or fallback_content), title
 
@@ -4202,116 +6050,64 @@ class AgentKernel:
             expected_step_outputs=[OutputKind.FILE_WRITTEN],
         )
 
-    def _build_scheduled_task_workflow(
-            self,
-            *,
-            user_text: str,
-            task_classification,
-            session_id: str | None = None,
-            channel: str | None = None,
-            channel_runtime: dict[str, Any] | None = None,
-    ) -> ToolDecision | None:
-        if task_classification is None:
-            return None
-
-        run_mode = str(getattr(task_classification, "run_mode", "immediate") or "immediate").strip().lower()
-        if run_mode != "scheduled":
-            return None
-
-        scheduled_plan = self.llm_client.plan_scheduled_task_arguments(
-            user_text=user_text,
-            task_classification=task_classification.model_dump(mode="json"),
-            current_time_iso=datetime.now().astimezone().isoformat(),
-            timezone="Asia/Shanghai",
-            recent_context=self._recent_conversation_text(),
-            hot_context_summary=self.hot_context_summary,
-            warm_memory_summary=self.warm_memory_summary,
-            cold_memory_summary=self.cold_memory_summary,
-            active_task_summary=self.active_task_summary,
-        )
-
-        if str(scheduled_plan.get("run_mode", "immediate") or "immediate").strip().lower() != "scheduled":
-            return None
-
-        task_type = str(scheduled_plan.get("task_type", "notify") or "notify").strip().lower()
-        if task_type not in {"notify", "deferred_agent_task"}:
-            task_type = "notify"
-
-        when_iso = str(scheduled_plan.get("when_iso", "") or "").strip()
-        timezone = str(scheduled_plan.get("timezone", "Asia/Shanghai") or "Asia/Shanghai").strip()
-        message = str(scheduled_plan.get("message", "") or "").strip()
-
-        task_payload = scheduled_plan.get("task_payload", {})
-        if not isinstance(task_payload, dict):
-            task_payload = {}
-
-        if channel_runtime:
-            task_payload = {
-                **task_payload,
-                "channel_runtime": channel_runtime,
-            }
-
-        arguments = {
-            "task_type": task_type,
-            "when_iso": when_iso,
-            "timezone": timezone,
-            "session_id": session_id,
-            "channel": channel,
-            "message": message,
-            "task_payload": task_payload,
-        }
-
-        return ToolDecision(
-            decision=DecisionType.TOOL_CALL,
-            intent="create_scheduled_task",
-            reason="The request is a scheduled future task, so create a deferred scheduled task instead of executing immediately.",
-            selected_tool="system.create_scheduled_task",
-            arguments=arguments,
-            risk_level=RiskLevel.LOW,
-            overall_task_goal=self._build_scheduled_task_goal(
-                user_text=user_text,
-                task_type=task_type,
-            ),
-            expected_step_outputs=[],
-        )
-
-    def _build_fired_scheduled_task_delivery_workflow(
+    def _build_legacy_recovery_followup(
         self,
         *,
-        runtime_channel: str | None = None,
-        runtime_channel_context: dict[str, Any] | None = None,
+        user_text: str,
+        planner_user_text: str,
+        overall_task_goal: TaskGoal | None,
+        completed_outputs: list[OutputKind],
+        candidate_state: CandidateState | None,
+        tool_results: list[ToolCallResult],
+        last_executed_decision: ToolDecision | None,
+        document_delivery_intent,
+        knowledge_request_intent,
+        site_search_intent,
+        recent_context: str,
     ) -> ToolDecision | None:
-        fire_context = self._extract_scheduled_task_fire_context(runtime_channel_context)
-        if fire_context is None or fire_context.get("phase") != "fired":
+        if not tool_results or last_executed_decision is None:
             return None
-        if fire_context.get("task_type") != "notify":
-            return None
-        if str(runtime_channel or "").strip() != "onebot_v11":
-            return None
-        if not self.registry.has_tool("qq.send_text"):
-            return None
-
-        message = str(fire_context.get("message") or "").strip()
-        if not message:
-            return None
-
-        return ToolDecision(
-            decision=DecisionType.TOOL_CALL,
-            intent="deliver_fired_scheduled_notification",
-            reason="This scheduled QQ notification has already fired, so deliver its prepared text to the current session now.",
-            selected_tool="qq.send_text",
-            arguments={
-                "message": message,
-                "target_kind": "current",
-            },
-            risk_level=RiskLevel.LOW,
-            overall_task_goal=TaskGoal(
-                summary="Deliver the fired scheduled QQ notification to the current session.",
-                required_outputs=[OutputKind.MESSAGE_SENT],
-                completion_mode="success",
+        for builder in (
+            lambda: self._build_candidate_write_followup(
+                user_text=planner_user_text,
+                overall_task_goal=overall_task_goal,
+                completed_outputs=completed_outputs,
+                candidate_state=candidate_state,
             ),
-            expected_step_outputs=[OutputKind.MESSAGE_SENT],
-        )
+            lambda: self._build_docx_edit_followup(
+                user_text=planner_user_text,
+                overall_task_goal=overall_task_goal,
+                completed_outputs=completed_outputs,
+                candidate_state=candidate_state,
+            ),
+            lambda: self._build_web_write_followup(
+                user_text=user_text,
+                overall_task_goal=overall_task_goal,
+                completed_outputs=completed_outputs,
+                tool_results=tool_results,
+                delivery_intent=document_delivery_intent,
+                recent_context=recent_context,
+            ),
+            lambda: self.web_retrieval_strategy.build_empty_result_fallback(
+                user_text=user_text,
+                last_decision=last_executed_decision,
+                last_result=tool_results[-1],
+                delivery_intent=document_delivery_intent,
+                knowledge_intent=knowledge_request_intent,
+                site_search_intent=site_search_intent,
+            ),
+            lambda: self.file_retrieval_strategy.build_empty_result_fallback(
+                user_text=user_text,
+                last_decision=last_executed_decision,
+                last_result=tool_results[-1],
+                candidate_state=candidate_state,
+                reliable_candidates=self._has_reliable_candidates(candidate_state, overall_task_goal),
+            ),
+        ):
+            decision = builder()
+            if decision is not None:
+                return decision
+        return None
 
     def handle_user_input(
             self,
@@ -4325,7 +6121,8 @@ class AgentKernel:
             runtime_channel_context: dict[str, Any] | None = None,
     ) -> TurnArtifacts:
         trace_id = f"trace_{uuid.uuid4().hex[:12]}"
-        session_id = f"session_{uuid.uuid4().hex[:10]}"
+        llm_metrics_start = len(getattr(self.llm_client, "last_call_metrics", []) or [])
+        session_id = str(runtime_session_id or "").strip() or f"session_{uuid.uuid4().hex[:10]}"
         artifacts = TurnArtifacts(trace_id=trace_id)
         tool_results: list[ToolCallResult] = []
         request_signatures: list[str] = []
@@ -4335,10 +6132,6 @@ class AgentKernel:
         completed_outputs: list[OutputKind] = []
         loop_stop_reason: str | None = None
         last_executed_decision: ToolDecision | None = None
-        locked_workflow_family: str | None = None
-        locked_workflow_nodes: list[dict[str, object]] = []
-        locked_workflow_spec: WorkflowSpec | None = None
-        locked_workflow_index = 0
         planner_invocations = 0
         critic_invocations = 0
         planner_bypass_count = 0
@@ -4346,8 +6139,8 @@ class AgentKernel:
         self.history.append(Message(role=Role.USER, content=user_text))
         recent_context = self._recent_conversation_text()
         channel_context_summary = self._build_channel_context_summary(runtime_channel, runtime_channel_context)
-        intent_bundle = self.intent_service.analyze(
-            user_text,
+        intent_bundle = self._build_single_source_intent_bundle(
+            user_text=user_text,
             recent_context=recent_context,
             hot_context_summary=self.hot_context_summary,
             warm_memory_summary=self.warm_memory_summary,
@@ -4357,54 +6150,43 @@ class AgentKernel:
             channel_context_summary=channel_context_summary,
         )
         task_graph = getattr(intent_bundle, "task_graph", None)
-        planner_user_text = (
-            str(getattr(task_graph, "primary_task_text", "") or "").strip()
-            or str(getattr(intent_bundle.task_envelope, "planning_focus_text", "") or "").strip()
-            or user_text
-        )
+        planner_user_text = user_text
         document_delivery_intent = intent_bundle.document_delivery
         knowledge_request_intent = intent_bundle.knowledge_request
         site_search_intent = intent_bundle.site_search
-        local_collection_request = self.local_collection_workflow.parse_request(
-            planner_user_text,
-            knowledge_request_intent,
-            task_classification=intent_bundle.task_classification,
-            recent_context=recent_context,
+        authoritative_required_outputs = list(
+            (active_overall_goal.required_outputs if active_overall_goal is not None else [])
+            or getattr(intent_bundle.task_envelope, "required_outputs", [])
+            or []
         )
-
-        scheduled_task_decision = None
-        if intent_bundle.task_classification is not None:
-            if self._should_schedule_request(
-                intent_bundle.task_classification,
-                runtime_channel_context=runtime_channel_context,
-            ):
-                try:
-                    scheduled_task_decision = self._build_scheduled_task_workflow(
-                        user_text=user_text,
-                        task_classification=intent_bundle.task_classification,
-                        session_id=runtime_session_id,
-                        channel=runtime_channel,
-                        channel_runtime=runtime_channel_context,
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    self.trace_store.append(
-                        "scheduled_task_planning_error",
-                        {
-                            "trace_id": trace_id,
-                            "error": str(exc),
-                        },
-                    )
-                    scheduled_task_decision = None
-
+        main_goal_locked = bool(authoritative_required_outputs)
+        authoritative_contract_workflow = self._has_authoritative_contract_workflow(intent_bundle.task_envelope)
 
         scripted_planner_decision_count = self._scripted_planner_decision_count()
         scripted_planner_decisions_used = 0
 
-        self.trace_store.append("user_input", {"trace_id": trace_id, "text": user_text, "planner_text": planner_user_text})
+        llm_runtime = {
+            "provider": str(getattr(self.config, "llm_provider", "ollama") or "ollama"),
+            "model": str(getattr(self.config, "model", "") or ""),
+            "chat_model": str(getattr(self.config, "chat_model", "") or ""),
+            "critic_model": str(getattr(self.config, "critic_model", "") or ""),
+            "response_model": str(getattr(self.config, "response_model", "") or ""),
+        }
+
+        self.trace_store.append(
+            "user_input",
+            {
+                "trace_id": trace_id,
+                "text": user_text,
+                "planner_text": planner_user_text,
+                "llm_runtime": llm_runtime,
+            },
+        )
         self.trace_store.append(
             "intent_context",
             {
                 "trace_id": trace_id,
+                "llm_runtime": llm_runtime,
                 "recent_context": recent_context,
                 "hot_context_summary": self.hot_context_summary,
                 "user_memory_summary": self.user_memory_summary,
@@ -4416,24 +6198,37 @@ class AgentKernel:
             },
         )
         self.trace_store.append(
-            "task_graph_intent",
+            "main_agent_context",
             {
                 "trace_id": trace_id,
-                "intent": None if task_graph is None else task_graph.model_dump(mode="json"),
+                "llm_runtime": llm_runtime,
                 "planner_text": planner_user_text,
+                "mode": "single_source_main_agent",
+                "context_layers_used": intent_bundle.task_envelope.context_layers_used,
+                "task_envelope": intent_bundle.task_envelope.model_dump(mode="json"),
             },
         )
         self.trace_store.append(
-            "document_delivery_intent",
-            {"trace_id": trace_id, "intent": document_delivery_intent.model_dump(mode="json")},
-        )
-        self.trace_store.append(
-            "knowledge_request_intent",
-            {"trace_id": trace_id, "intent": knowledge_request_intent.model_dump(mode="json")},
-        )
-        self.trace_store.append(
-            "site_search_intent",
-            {"trace_id": trace_id, "intent": site_search_intent.model_dump(mode="json")},
+            "workflow_contract_debug",
+            {
+                "trace_id": trace_id,
+                "source": "main_agent_contract",
+                "primary_objective": intent_bundle.task_envelope.primary_objective,
+                "workflow": self._build_contract_workflow_debug_payload(
+                    workflow_spec=getattr(intent_bundle.task_envelope, "workflow_spec", None),
+                    completed_outputs=[],
+                    candidate_state=active_candidate_state,
+                    observed_workflow_state=observed_workflow_state,
+                    active_overall_goal=TaskGoal(
+                        summary=str(getattr(intent_bundle.task_envelope, "primary_objective", "") or "").strip()
+                        or "Complete the active task.",
+                        required_outputs=list(getattr(intent_bundle.task_envelope, "required_outputs", []) or []),
+                        completion_mode="outputs",
+                    )
+                    if getattr(intent_bundle.task_envelope, "required_outputs", None)
+                    else active_overall_goal,
+                ),
+            },
         )
         self.trace_store.append(
             "memory_candidate_intent",
@@ -4444,177 +6239,11 @@ class AgentKernel:
                 else None,
             },
         )
-        self.trace_store.append(
-            "task_classification",
-            {
-                "trace_id": trace_id,
-                "intent": None
-                if intent_bundle.task_classification is None
-                else intent_bundle.task_classification.model_dump(mode="json"),
-            },
-        )
-        self.trace_store.append(
-            "answerability",
-            {
-                "trace_id": trace_id,
-                "intent": getattr(intent_bundle, "answerability", None).model_dump(mode="json")
-                if getattr(intent_bundle, "answerability", None) is not None
-                else None,
-            },
-        )
-        self.trace_store.append(
-            "task_envelope",
-            {
-                "trace_id": trace_id,
-                "intent": getattr(intent_bundle, "task_envelope", None).model_dump(mode="json")
-                if getattr(intent_bundle, "task_envelope", None) is not None
-                else None,
-            },
-        )
-        self.trace_store.append(
-            "local_collection_request",
-            {
-                "trace_id": trace_id,
-                "intent": None if local_collection_request is None else local_collection_request.model_dump(mode="json"),
-            },
-        )
-        locked_workflow_spec = self._plan_initial_workflow_spec(
-            user_text=planner_user_text,
-            intent_bundle=intent_bundle,
-            recent_context=recent_context,
-            trace_id=trace_id,
-        )
-        if locked_workflow_spec is not None:
-            locked_workflow_family = "llm_workflow_spec"
-            if locked_workflow_spec.goal is not None:
-                active_overall_goal = locked_workflow_spec.goal
-            self.trace_store.append(
-                "workflow_lock_initialized",
-                {
-                    "trace_id": trace_id,
-                    "workflow_family": locked_workflow_family,
-                    "source": "llm_workflow_spec",
-                    "workflow_spec": locked_workflow_spec.model_dump(mode="json"),
-                },
-            )
         self._emit_progress(progress_callback, "received", "我先记下你的需求，准备开始分析。", {"trace_id": trace_id})
 
         try:
             for step in range(self.config.max_steps):
                 observations = ContextBuilder.build_observations(tool_results)
-
-                if step == 0 and scheduled_task_decision is not None:
-                    decision = scheduled_task_decision
-                    artifacts.decision = decision
-                    active_overall_goal = decision.overall_task_goal
-                    artifacts.overall_task_goal = active_overall_goal
-                    critic_invocations += 1
-                    review = self.critic.review(
-                        messages=self._context_messages(),
-                        decision=decision,
-                        tool_manifests=self.registry.list_manifests(),
-                        observations=observations,
-                    )
-                    self.trace_store.append(
-                        "decision_review",
-                        {
-                            "trace_id": trace_id,
-                            "step": step,
-                            "source": "scheduled_task_short_circuit",
-                            "review": review.model_dump(mode="json"),
-                        },
-                    )
-                    if not review.approved and review.suggested_decision is None:
-                        raise ValueError(f"Scheduled task review rejected planner output: {review.summary or review.issues}")
-                    decision = self._resolve_reviewed_decision(decision, review)
-                    self.validator.validate(decision)
-                    self.validator.validate_against_task_state(
-                        decision,
-                        overall_task_goal=active_overall_goal,
-                        completed_outputs=completed_outputs,
-                    )
-                    self.guardrails.validate(decision)
-
-                    self.trace_store.append(
-                        "decision_effective",
-                        {
-                            "trace_id": trace_id,
-                            "step": step,
-                            "source": "scheduled_task_short_circuit",
-                            "decision": decision.model_dump(mode="json"),
-                            "active_overall_goal": None
-                            if active_overall_goal is None
-                            else active_overall_goal.model_dump(mode="json"),
-                        },
-                    )
-
-                    request = self.registry.build_request(
-                        trace_id=trace_id,
-                        session_id=session_id,
-                        tool_name=decision.selected_tool or "",
-                        arguments=decision.arguments,
-                    )
-                    request_signatures.append(self.loop_controller.request_signature(decision))
-                    self.trace_store.append(
-                        "tool_request",
-                        {"trace_id": trace_id, "step": step, "request": request.model_dump(mode="json")},
-                    )
-
-                    result = self.registry.execute(request)
-                    last_executed_decision = decision
-                    tool_results.append(result)
-                    artifacts.tool_results.append(result)
-
-                    if result.status == "success" and decision.selected_tool:
-                        manifest = self.registry.get_manifest(decision.selected_tool)
-                        effective_outputs = self.completion_judge.resolve_effective_outputs(
-                            tool_name=decision.selected_tool,
-                            produced_outputs=list(manifest.produces),
-                            result=result,
-                        )
-                        for output_name in effective_outputs:
-                            if output_name not in completed_outputs:
-                                completed_outputs.append(output_name)
-
-                    artifacts.completed_outputs = list(completed_outputs)
-                    self.history.append(
-                        Message(role=Role.TOOL, content=f"{decision.selected_tool}: {result.model_dump(mode='json')}")
-                    )
-                    self.trace_store.append(
-                        "tool_result",
-                        {"trace_id": trace_id, "step": step, "result": result.model_dump(mode="json")},
-                    )
-
-                    completion = self.completion_judge.assess(
-                        overall_task_goal=active_overall_goal,
-                        completed_outputs=completed_outputs,
-                        tool_results=tool_results,
-                    )
-                    completion, _, completion_review = self._review_execution_state(
-                        user_text=user_text,
-                        overall_task_goal=active_overall_goal,
-                        completed_outputs=completed_outputs,
-                        tool_results=tool_results,
-                        candidate_state=active_candidate_state,
-                        completion=completion,
-                        stop_reason=loop_stop_reason,
-                        document_delivery_intent=document_delivery_intent,
-                        knowledge_request_intent=knowledge_request_intent,
-                        site_search_intent=site_search_intent,
-                        task_classification=intent_bundle.task_classification,
-                    )
-                    self.trace_store.append(
-                        "completion_check",
-                        {
-                            "trace_id": trace_id,
-                            "step": step,
-                            "assessment": completion.model_dump(mode="json"),
-                            "review": completion_review.model_dump(mode="json"),
-                        },
-                    )
-                    if completion.done:
-                        loop_stop_reason = "completion_judge"
-                        break
 
                 self._emit_progress(
                     progress_callback,
@@ -4623,119 +6252,11 @@ class AgentKernel:
                     {"step": step},
                 )
 
-                if step == 0:
-                    task_graph_pending = self._build_task_graph_pending_task(
-                        user_text=user_text,
-                        task_graph=task_graph,
-                        overall_task_goal=active_overall_goal,
-                    )
-                    if task_graph_pending is not None:
-                        artifacts.pending_task = task_graph_pending
-                        loop_stop_reason = "task_graph_waiting_for_input"
-                        self.trace_store.append(
-                            "task_graph_pending",
-                            {
-                                "trace_id": trace_id,
-                                "step": step,
-                                "pending_task": task_graph_pending.model_dump(mode="json"),
-                            },
-                        )
-                        break
-
                 fallback_decision = None
                 scripted_planner_has_pending_decision = scripted_planner_decisions_used < scripted_planner_decision_count
-                allow_programmatic_lookup_workflow = (
-                    scripted_planner_decision_count == 0
-                    and str(getattr(knowledge_request_intent, "knowledge_type", "") or "") != "qq_history"
-                )
-                workflow_binding = self._bind_workflow_plan(
-                    user_text=planner_user_text,
-                    intent_bundle=intent_bundle,
-                    overall_task_goal=active_overall_goal,
-                    candidate_state=active_candidate_state,
-                    completed_outputs=completed_outputs,
-                    tool_results=tool_results,
-                    recent_context=recent_context,
-                    runtime_channel=runtime_channel,
-                    runtime_channel_context=runtime_channel_context,
-                )
-
-                bound_workflow_family = str(workflow_binding.get("workflow_family") or "generic")
-                bound_workflow_decision = workflow_binding.get("workflow_decision")
-                bound_goal = workflow_binding.get("overall_task_goal")
-                if (
-                    locked_workflow_family is None
-                    and isinstance(bound_workflow_decision, ToolDecision)
-                    and bound_workflow_family != "generic"
-                    and self._should_use_locked_workflow_decision(
-                        bound_workflow_decision,
-                        workflow_family=bound_workflow_family,
-                        request_signatures=set(request_signatures),
-                        request_signature=self.loop_controller.request_signature,
-                    )
-                ):
-                    locked_workflow_family = bound_workflow_family
-                    self.trace_store.append(
-                        "workflow_lock_initialized",
-                        {
-                            "trace_id": trace_id,
-                            "workflow_family": locked_workflow_family,
-                            "goal": None if bound_goal is None else bound_goal.model_dump(mode="json"),
-                            "first_node": {
-                                "tool": bound_workflow_decision.selected_tool,
-                                "intent": bound_workflow_decision.intent,
-                                "expected_outputs": [item.value for item in bound_workflow_decision.expected_step_outputs],
-                            },
-                        },
-                    )
-                if locked_workflow_family is not None:
-                    bound_workflow_family = locked_workflow_family
-                workflow_spec_response_ready = False
-                if locked_workflow_spec is not None:
-                    completed_set = set(completed_outputs)
-                    workflow_spec_decision: ToolDecision | None = None
-                    while locked_workflow_index < len(locked_workflow_spec.nodes):
-                        node = locked_workflow_spec.nodes[locked_workflow_index]
-                        if node.tool is None:
-                            workflow_spec_response_ready = True
-                            locked_workflow_index = len(locked_workflow_spec.nodes)
-                            break
-                        if node.produces and all(output in completed_set for output in node.produces):
-                            locked_workflow_index += 1
-                            continue
-                        workflow_spec_decision = self._workflow_spec_node_to_decision(
-                            spec=locked_workflow_spec,
-                            node=node,
-                        )
-                        locked_workflow_index += 1
-                        break
-                    if workflow_spec_response_ready:
-                        self.trace_store.append(
-                            "loop_stop",
-                            {
-                                "trace_id": trace_id,
-                                "step": step,
-                                "reason": "workflow_spec_response_node",
-                                "details": "Locked workflow reached its response node.",
-                            },
-                        )
-                        loop_stop_reason = "workflow_spec_response_node"
-                        break
-                    if workflow_spec_decision is not None:
-                        bound_workflow_decision = workflow_spec_decision
-                        bound_goal = workflow_spec_decision.overall_task_goal or bound_goal
-                        workflow_decision = workflow_spec_decision
-                        self.trace_store.append(
-                            "workflow_node_selected",
-                            {
-                                "trace_id": trace_id,
-                                "step": step,
-                                "workflow_family": locked_workflow_family,
-                                "source": "llm_workflow_spec",
-                                "node": locked_workflow_spec.nodes[locked_workflow_index - 1].model_dump(mode="json"),
-                                "decision": workflow_spec_decision.model_dump(mode="json"),
-                            },
-                        )
+                bound_workflow_family = "generic"
+                bound_workflow_decision = None
+                bound_goal = None
 
                 if active_overall_goal is None and isinstance(bound_goal, TaskGoal):
                     active_overall_goal = bound_goal
@@ -4757,139 +6278,97 @@ class AgentKernel:
                     completed_outputs=completed_outputs,
                     candidate_state=active_candidate_state,
                 )
-                llm_local_search_decision = None if not allow_programmatic_lookup_workflow else self._build_llm_local_search_workflow(
+                contract_workflow_decision = None if scripted_planner_has_pending_decision else self._build_contract_workflow_followup(
+                    workflow_spec=getattr(intent_bundle.task_envelope, "workflow_spec", None),
+                    task_envelope=intent_bundle.task_envelope,
                     user_text=planner_user_text,
-                    completed_outputs=completed_outputs,
                     candidate_state=active_candidate_state,
                     overall_task_goal=active_overall_goal,
-                    knowledge_intent=knowledge_request_intent,
-                    task_classification=intent_bundle.task_classification,
-                    supports_message_delivery=self._supports_message_delivery(),
-                )
-                shared_proposals = self._build_shared_workflow_proposals(
-                    user_text=planner_user_text,
                     completed_outputs=completed_outputs,
-                    candidate_state=active_candidate_state,
-                    overall_task_goal=active_overall_goal,
-                    task_classification=intent_bundle.task_classification,
-                    knowledge_intent=knowledge_request_intent,
-                    document_delivery_intent=document_delivery_intent,
-                    site_search_intent=site_search_intent,
                     tool_results=tool_results,
-                    local_search_decision=llm_local_search_decision,
-                    allow_programmatic_lookup_workflow=allow_programmatic_lookup_workflow,
-                    local_search_source="local_search_planner",
-                    local_search_priority=98,
-                    local_search_reason="LLM-planned initial local search workflow",
-                    document_summary_priority=82,
-                    document_summary_reason="Local document summary workflow",
-                    document_operation_priority=90,
-                    document_operation_reason="Local document structure and editing workflow",
-                    file_delivery_priority=88,
-                    file_delivery_reason="Local file delivery workflow",
-                    local_lookup_priority=84,
-                    local_lookup_reason="Hybrid local file lookup workflow",
-                    web_target_priority=86,
-                    web_target_reason="Explicit website open/search workflow",
-                    web_lookup_priority=74,
-                    web_lookup_reason="General web research workflow",
+                    supports_message_delivery=self.registry.has_tool("qq.send_file"),
                 )
-                proposals: list[WorkflowProposal] = [
-                    shared_proposals[0],
-                    WorkflowProposal(
-                        source="state_transition",
-                        family="state_transition",
-                        priority=99,
-                        reason="Advance directly from the observed workflow state.",
-                        decision=None if scripted_planner_has_pending_decision else self._build_state_transition_followup(
-                            user_text=planner_user_text,
-                            workflow_state=observed_workflow_state,
-                            candidate_state=active_candidate_state,
-                            overall_task_goal=active_overall_goal,
-                            completed_outputs=completed_outputs,
-                            supports_message_delivery=self.registry.has_tool("qq.send_file"),
-                        ),
-                    ),
-                    WorkflowProposal(
-                        source="local_collection",
-                        family="local_collection",
-                        priority=95,
-                        reason="Structured local collection workflow",
-                        decision=None if not allow_programmatic_lookup_workflow else self.local_collection_workflow.build_next_decision(
-                            user_text=planner_user_text,
-                            completed_outputs=completed_outputs,
-                            tool_results=tool_results,
-                            intent=local_collection_request,
-                        ),
-                    ),
-                    WorkflowProposal(
-                        source="file_strategy",
-                        family="file_lookup",
-                        priority=76,
-                        reason="Conservative file lookup fallback",
-                        decision=None if not allow_programmatic_lookup_workflow else self.file_retrieval_strategy.build_initial_lookup(
-                            user_text=planner_user_text,
-                            completed_outputs=completed_outputs,
-                            candidate_state=active_candidate_state,
-                            overall_task_goal=active_overall_goal,
-                        ),
-                    ),
-                    *shared_proposals[1:],
-                    WorkflowProposal(
-                        source="candidate_followup",
-                        family="candidate_followup",
-                        priority=92,
-                        reason="Continue from previously collected candidates",
-                        decision=None if scripted_planner_has_pending_decision else self._build_candidate_action_followup(
-                            user_text=planner_user_text,
-                            overall_task_goal=active_overall_goal,
-                            completed_outputs=completed_outputs,
-                            candidate_state=active_candidate_state,
-                            supports_message_delivery=self._supports_message_delivery(),
-                        ),
-                    ),
-                ]
-                workflow_decision = bound_workflow_decision
-                if tool_results and last_executed_decision is not None:
-                    fallback_decision = self._build_candidate_write_followup(
+                workflow_decision = contract_workflow_decision
+                if (
+                    workflow_decision is None
+                    and not authoritative_contract_workflow
+                    and not scripted_planner_has_pending_decision
+                ):
+                    workflow_decision = self._build_state_transition_followup(
+                        user_text=planner_user_text,
+                        workflow_state=observed_workflow_state,
+                        candidate_state=active_candidate_state,
+                        overall_task_goal=active_overall_goal,
+                        completed_outputs=completed_outputs,
+                        supports_message_delivery=self.registry.has_tool("qq.send_file"),
+                    )
+                if (
+                    workflow_decision is None
+                    and not authoritative_contract_workflow
+                    and not scripted_planner_has_pending_decision
+                ):
+                    workflow_decision = self._build_candidate_action_followup(
                         user_text=planner_user_text,
                         overall_task_goal=active_overall_goal,
                         completed_outputs=completed_outputs,
                         candidate_state=active_candidate_state,
+                        supports_message_delivery=self._supports_message_delivery(),
                     )
-                    if fallback_decision is None:
-                        fallback_decision = self._build_docx_edit_followup(
-                            user_text=planner_user_text,
-                            overall_task_goal=active_overall_goal,
+                contract_blocked_decision = None
+                if (
+                    workflow_decision is None
+                    and authoritative_contract_workflow
+                    and not scripted_planner_has_pending_decision
+                ):
+                    contract_blocked_decision = self._build_contract_blocked_decision(
+                        workflow_spec=getattr(intent_bundle.task_envelope, "workflow_spec", None),
+                        overall_task_goal=active_overall_goal,
+                        completed_outputs=completed_outputs,
+                    )
+                    workflow_decision = contract_blocked_decision
+                if contract_workflow_decision is not None:
+                    state_machine_source = "contract_workflow"
+                elif contract_blocked_decision is not None:
+                    state_machine_source = "contract_blocked"
+                elif workflow_decision is not None:
+                    state_machine_source = "observed_workflow"
+                else:
+                    state_machine_source = "no_workflow_decision"
+                self.trace_store.append(
+                    "state_machine_debug",
+                    {
+                        "trace_id": trace_id,
+                        "step": step,
+                        "phase": "before_decision",
+                        "source": state_machine_source,
+                        "workflow": self._build_contract_workflow_debug_payload(
+                            workflow_spec=getattr(intent_bundle.task_envelope, "workflow_spec", None),
                             completed_outputs=completed_outputs,
                             candidate_state=active_candidate_state,
-                        )
-                    if fallback_decision is None:
-                        fallback_decision = self._build_web_write_followup(
-                            user_text=user_text,
-                            overall_task_goal=active_overall_goal,
-                            completed_outputs=completed_outputs,
-                            tool_results=tool_results,
-                            delivery_intent=document_delivery_intent,
-                            recent_context=recent_context,
-                        )
-                    if fallback_decision is None:
-                        fallback_decision = self.web_retrieval_strategy.build_empty_result_fallback(
-                            user_text=user_text,
-                            last_decision=last_executed_decision,
-                            last_result=tool_results[-1],
-                            delivery_intent=document_delivery_intent,
-                            knowledge_intent=knowledge_request_intent,
-                            site_search_intent=site_search_intent,
-                        )
-                    if fallback_decision is None:
-                        fallback_decision = self.file_retrieval_strategy.build_empty_result_fallback(
-                            user_text=user_text,
-                            last_decision=last_executed_decision,
-                            last_result=tool_results[-1],
-                            candidate_state=active_candidate_state,
-                            reliable_candidates=self._has_reliable_candidates(active_candidate_state, active_overall_goal),
-                        )
+                            observed_workflow_state=observed_workflow_state,
+                            active_overall_goal=active_overall_goal,
+                            selected_decision=workflow_decision,
+                        ),
+                    },
+                )
+                if (
+                    tool_results
+                    and last_executed_decision is not None
+                    and not authoritative_contract_workflow
+                ):
+                    fallback_decision = self._build_legacy_recovery_followup(
+                        user_text=user_text,
+                        planner_user_text=planner_user_text,
+                        overall_task_goal=active_overall_goal,
+                        completed_outputs=completed_outputs,
+                        candidate_state=active_candidate_state,
+                        tool_results=tool_results,
+                        last_executed_decision=last_executed_decision,
+                        document_delivery_intent=document_delivery_intent,
+                        knowledge_request_intent=knowledge_request_intent,
+                        site_search_intent=site_search_intent,
+                        recent_context=recent_context,
+                    )
 
                 try:
                     state_machine_repair = workflow_decision or fallback_decision
@@ -4904,7 +6383,22 @@ class AgentKernel:
                         *observations,
                         f"Bound workflow family: {bound_workflow_family}",
                         f"Allowed decision types for this step: {sorted(allowed_actions)}",
+                        self._format_main_agent_context_observation(
+                            user_text=user_text,
+                            recent_context=recent_context,
+                            active_task_summary=self.active_task_summary,
+                            channel_context_summary=channel_context_summary,
+                            hot_context_summary=self.hot_context_summary,
+                            warm_memory_summary=self.warm_memory_summary,
+                            learning_memory_summary=self.learning_memory_summary,
+                            cold_memory_summary=self.cold_memory_summary,
+                        ),
                     ]
+                    planner_observations.append(
+                        "Main agent execution contract. This is authoritative task scope, not tool arguments. "
+                        "When calling a tool, convert grounded_inputs into that tool's declared input schema and do not copy unrelated keys directly:\n"
+                        + intent_bundle.task_envelope.model_dump_json(exclude_none=True)
+                    )
 
                     if active_overall_goal is not None:
                         planner_observations.append(
@@ -4921,43 +6415,18 @@ class AgentKernel:
                         else "State machine selected a grounded recovery step after planner output was unavailable or incomplete."
                     )
                     decision_source = "planner"
-                    if (
-                        locked_workflow_family is not None
-                        and self._should_use_locked_workflow_decision(
-                            workflow_decision,
-                            workflow_family=bound_workflow_family,
-                            request_signatures=set(request_signatures),
-                            request_signature=self.loop_controller.request_signature,
-                        )
-                    ):
-                        raw_decision = workflow_decision
+                    if contract_blocked_decision is not None and state_machine_repair is contract_blocked_decision:
+                        raw_decision = contract_blocked_decision
                         review = DecisionReview(
                             approved=True,
-                            issues=[],
-                            summary="Trusted the locked workflow node without re-running the general planner.",
+                            issues=["authoritative_contract_blocked"],
+                            summary="The main-agent workflow is authoritative and has no executable next node, so the kernel did not re-plan the task.",
                             suggested_decision=None,
                         )
-                        planner_bypass_count += 1
-                        decision_source = "workflow_locked"
-                        locked_workflow_nodes.append(
-                            {
-                                "step": step,
-                                "tool": raw_decision.selected_tool,
-                                "intent": raw_decision.intent,
-                                "expected_outputs": [item.value for item in raw_decision.expected_step_outputs],
-                            }
-                        )
-                        self.trace_store.append(
-                            "workflow_node_selected",
-                            {
-                                "trace_id": trace_id,
-                                "step": step,
-                                "workflow_family": locked_workflow_family,
-                                "node": locked_workflow_nodes[-1],
-                                "decision": raw_decision.model_dump(mode="json"),
-                            },
-                        )
-                    elif self._should_short_circuit_state_machine_repair(
+                        decision_source = "contract_blocked"
+                    elif (
+                        (not main_goal_locked) or state_machine_repair is contract_workflow_decision
+                    ) and self._should_short_circuit_state_machine_repair(
                         state_machine_repair,
                         has_prior_progress=has_prior_progress,
                         request_signatures=request_signatures,
@@ -4986,14 +6455,17 @@ class AgentKernel:
                             planner_invocations += 1
                             raw_decision = self.llm_client.decide(
                                 messages=self._context_messages(),
-                                tool_manifests=self.registry.list_manifests(),
+                                tool_manifests=self._scoped_manifests(intent_bundle.task_envelope),
                                 observations=planner_observations,
                                 allowed_decisions=sorted(allowed_actions),
                                 bound_workflow_family=bound_workflow_family,
                             )
                             raw_decision = self._normalize_network_lookup_decision(raw_decision, user_text=user_text)
                             scripted_planner_decisions_used += 1
-                            if not self._planner_decision_within_allowed_actions(
+                            if raw_decision.selected_tool and raw_decision.selected_tool.startswith("skill."):
+                                # skill 调用跳过所有 contract/action 约束检查
+                                pass
+                            elif not self._planner_decision_within_allowed_actions(
                                     raw_decision,
                                     allowed_actions=allowed_actions,
                                     overall_task_goal=active_overall_goal,
@@ -5025,7 +6497,21 @@ class AgentKernel:
                                     )
                                     decision_source = "workflow_policy_clarify"
                             else:
-                                if self._should_auto_approve_write_followup(raw_decision, tool_results) or self._should_auto_approve_candidate_followup(raw_decision, tool_results):
+                                if raw_decision.selected_tool and raw_decision.selected_tool.startswith("skill."):
+                                    # skill calls skip critic — they're self-contained and pre-validated
+                                    review = DecisionReview(
+                                        approved=True, issues=[], summary="Skill call — auto-approved.", suggested_decision=None,
+                                    )
+                                    decision_source = "skill_auto_approved"
+                                elif self._should_auto_approve_low_risk_tool_decision(raw_decision):
+                                    review = DecisionReview(
+                                        approved=True,
+                                        issues=[],
+                                        summary="Auto-approved a low-risk read-only tool call; validator and guardrails still run before execution.",
+                                        suggested_decision=None,
+                                    )
+                                    decision_source = "planner_low_risk_auto_approved"
+                                elif self._should_auto_approve_write_followup(raw_decision, tool_results) or self._should_auto_approve_candidate_followup(raw_decision, tool_results):
                                     review = DecisionReview(
                                         approved=True,
                                         issues=[],
@@ -5038,7 +6524,7 @@ class AgentKernel:
                                     review = self.critic.review(
                                         messages=self._context_messages(),
                                         decision=raw_decision,
-                                        tool_manifests=self.registry.list_manifests(),
+                                        tool_manifests=self._scoped_manifests(intent_bundle.task_envelope),
                                         observations=planner_observations,
                                     )
                                     decision_source = "planner_reviewed"
@@ -5048,7 +6534,9 @@ class AgentKernel:
                                 and effective_planner_decision.decision == DecisionType.TOOL_CALL
                                 and self.loop_controller.request_signature(effective_planner_decision) in request_signatures
                             )
-                            if planner_repeated_previous_request or self._planner_response_should_use_state_machine_repair(
+                            if raw_decision.selected_tool and raw_decision.selected_tool.startswith("skill."):
+                                pass  # skill 跳过 state machine repair
+                            elif planner_repeated_previous_request or self._planner_response_should_use_state_machine_repair(
                                 effective_planner_decision,
                                 state_machine_repair,
                                 completed_outputs,
@@ -5138,6 +6626,36 @@ class AgentKernel:
                         self._resolve_reviewed_decision(raw_decision, review),
                         user_text=user_text,
                     )
+                    decision, argument_repair_trace = self._repair_decision_arguments_from_task_contract(
+                        decision,
+                        task_envelope=intent_bundle.task_envelope,
+                    )
+                    if argument_repair_trace is not None:
+                        self.trace_store.append(
+                            "decision_argument_repair",
+                            {
+                                "trace_id": trace_id,
+                                "step": step,
+                                "source": decision_source,
+                                "details": argument_repair_trace,
+                                "decision": decision.model_dump(mode="json"),
+                            },
+                        )
+                    decision, document_write_reroute_trace = self._route_unsafe_document_write_decision(
+                        decision,
+                        task_envelope=intent_bundle.task_envelope,
+                    )
+                    if document_write_reroute_trace is not None:
+                        self.trace_store.append(
+                            "decision_tool_reroute",
+                            {
+                                "trace_id": trace_id,
+                                "step": step,
+                                "source": decision_source,
+                                "details": document_write_reroute_trace,
+                                "decision": decision.model_dump(mode="json"),
+                            },
+                        )
                     decision, upstream_constraint_trace = self._enforce_upstream_constraints_on_decision(
                         decision,
                         task_envelope=intent_bundle.task_envelope,
@@ -5158,18 +6676,6 @@ class AgentKernel:
                                 "decision": decision.model_dump(mode="json"),
                             },
                         )
-                    decision, workflow_argument_trace = self.workflow_argument_planner.plan(
-                        decision=decision,
-                        user_text=user_text,
-                        workflow_family=bound_workflow_family,
-                        decision_source=decision_source,
-                        observations=planner_observations,
-                        completed_outputs=completed_outputs,
-                        overall_task_goal=active_overall_goal,
-                        candidate_state=active_candidate_state,
-                        workflow_state=observed_workflow_state,
-                        task_envelope=intent_bundle.task_envelope,
-                    )
                     decision, post_argument_constraint_trace = self._enforce_upstream_constraints_on_decision(
                         decision,
                         task_envelope=intent_bundle.task_envelope,
@@ -5178,16 +6684,6 @@ class AgentKernel:
                         completed_outputs=completed_outputs,
                         state_machine_repair=state_machine_repair,
                     )
-                    if workflow_argument_trace is not None:
-                        self.trace_store.append(
-                            "workflow_argument_planner",
-                            {
-                                "trace_id": trace_id,
-                                "step": step,
-                                "decision_source": decision_source,
-                                "trace": workflow_argument_trace,
-                            },
-                        )
                     if post_argument_constraint_trace is not None:
                         self.trace_store.append(
                             "upstream_constraint_applied",
@@ -5259,6 +6755,52 @@ class AgentKernel:
                                     "decision": decision.model_dump(mode="json"),
                                 },
                             )
+                        elif (
+                            isinstance(exc, DecisionValidationError)
+                            and decision is not None
+                            and decision.decision == DecisionType.TOOL_CALL
+                            and decision.selected_tool
+                        ):
+                            repaired_decision = self._try_repair_missing_arguments(
+                                decision=decision,
+                                error=str(exc),
+                                user_text=user_text,
+                                recent_context=recent_context,
+                                trace_id=trace_id,
+                                step=step,
+                                tool_results=tool_results,
+                            )
+                            if repaired_decision is not None:
+                                decision = repaired_decision
+                                decision, post_repair_constraint_trace = self._enforce_upstream_constraints_on_decision(
+                                    decision,
+                                    task_envelope=intent_bundle.task_envelope,
+                                    task_graph=intent_bundle.task_graph,
+                                    overall_task_goal=active_overall_goal,
+                                    completed_outputs=completed_outputs,
+                                    state_machine_repair=state_machine_repair,
+                                )
+                                self.trace_store.append(
+                                    "decision_argument_repaired_by_llm",
+                                    {
+                                        "trace_id": trace_id,
+                                        "step": step,
+                                        "original_error": str(exc),
+                                        "decision": decision.model_dump(mode="json"),
+                                    },
+                                )
+                            else:
+                                self.trace_store.append(
+                                    "loop_stop",
+                                    {
+                                        "trace_id": trace_id,
+                                        "step": step,
+                                        "reason": "finalize_after_decision_error",
+                                        "details": str(exc),
+                                    },
+                                )
+                                loop_stop_reason = "finalize_after_decision_error"
+                                break
                         elif self.loop_controller.should_finalize_after_decision_error(tool_results):
                             self.trace_store.append(
                                 "loop_stop",
@@ -5275,7 +6817,15 @@ class AgentKernel:
                             raise
 
                 artifacts.decision = decision
-                if decision.overall_task_goal is not None and decision.overall_task_goal.required_outputs:
+                if main_goal_locked:
+                    if active_overall_goal is None:
+                        active_overall_goal = TaskGoal(
+                            summary=str(getattr(intent_bundle.task_envelope, "primary_objective", "") or "").strip()
+                            or "Complete the active task.",
+                            required_outputs=list(authoritative_required_outputs),
+                            completion_mode="outputs",
+                        )
+                elif decision.overall_task_goal is not None and decision.overall_task_goal.required_outputs:
                     active_overall_goal = self._merge_goals(active_overall_goal, decision.overall_task_goal)
                 elif active_overall_goal is None and decision.selected_tool:
                     manifest = self.registry.get_manifest(decision.selected_tool)
@@ -5366,11 +6916,45 @@ class AgentKernel:
                     session_id=session_id,
                     tool_name=decision.selected_tool or "",
                     arguments=decision.arguments,
+                    execution_context=build_tool_execution_context(
+                        decision=decision,
+                        user_text=user_text,
+                        task_envelope=intent_bundle.task_envelope,
+                        overall_task_goal=active_overall_goal,
+                        recent_context=recent_context,
+                        workflow_family=bound_workflow_family,
+                    ),
+                )
+                tool_use_context = ToolUseContext.from_execution_context(
+                    trace_id=trace_id,
+                    session_id=session_id,
+                    workspace_root=self.config.workspace_root,
+                    execution_context=request.execution_context,
+                    channel=runtime_channel,
+                    access_policy=(
+                        runtime_channel_context.get("access_policy")
+                        if isinstance(runtime_channel_context, dict)
+                        and isinstance(runtime_channel_context.get("access_policy"), dict)
+                        else None
+                    ),
+                    runtime_settings=runtime_channel_context if isinstance(runtime_channel_context, dict) else None,
+                    completed_outputs=completed_outputs,
+                    metadata={
+                        "step": step,
+                        "decision_source": decision_source,
+                        "risk_level": decision.risk_level.value,
+                        "selected_tool": decision.selected_tool,
+                    },
                 )
                 request_signatures.append(self.loop_controller.request_signature(decision))
                 self.trace_store.append(
                     "tool_request",
-                    {"trace_id": trace_id, "step": step, "request": request.model_dump(mode="json")},
+                    {
+                        "trace_id": trace_id,
+                        "step": step,
+                        "request": request.model_dump(mode="json"),
+                        "tool_use_context": tool_use_context.model_dump(mode="json"),
+                    },
                 )
                 self._emit_progress(
                     progress_callback,
@@ -5379,18 +6963,12 @@ class AgentKernel:
                     {"step": step, "tool_name": request.tool_name, "arguments": request.arguments},
                 )
 
-                result = self.registry.execute(request)
+                result = self.registry.execute(request, context=tool_use_context)
                 last_executed_decision = decision
                 tool_results.append(result)
                 artifacts.tool_results.append(result)
-                if result.status == "success" and decision.selected_tool:
-                    manifest = self.registry.get_manifest(decision.selected_tool)
-                    effective_outputs = self.completion_judge.resolve_effective_outputs(
-                        tool_name=decision.selected_tool,
-                        produced_outputs=list(manifest.produces),
-                        result=result,
-                    )
-                    for output_name in effective_outputs:
+                if result.status == "success":
+                    for output_name in result.produced_outputs:
                         if output_name not in completed_outputs:
                             completed_outputs.append(output_name)
                     active_candidate_state = self._derive_candidate_state(decision, result, active_candidate_state)
@@ -5398,6 +6976,19 @@ class AgentKernel:
                         completed_outputs.append(OutputKind.OBJECT_CANDIDATES)
                 artifacts.completed_outputs = list(completed_outputs)
                 artifacts.candidate_state = active_candidate_state
+
+                # skill 执行完后立刻判断是否所有 required_outputs 已满足，是则跳过下一轮 decide
+                is_skill = decision.selected_tool and decision.selected_tool.startswith("skill.")
+                if is_skill and active_overall_goal is not None and active_overall_goal.required_outputs:
+                    missing = [o for o in active_overall_goal.required_outputs if o not in completed_outputs]
+                    if not missing:
+                        self.trace_store.append(
+                            "loop_stop",
+                            {"trace_id": trace_id, "step": step, "reason": "skill_completed_all_outputs"},
+                        )
+                        loop_stop_reason = "skill_completed_all_outputs"
+                        break
+
                 if self._should_offer_candidate_selection(
                     user_text=user_text,
                     candidate_state=active_candidate_state,
@@ -5473,7 +7064,7 @@ class AgentKernel:
                     document_delivery_intent=document_delivery_intent,
                     knowledge_request_intent=knowledge_request_intent,
                     site_search_intent=site_search_intent,
-                    task_classification=intent_bundle.task_classification,
+                    task_classification=None if authoritative_contract_workflow else intent_bundle.task_classification,
                 )
                 observation_summary = self._build_execution_summary(
                     user_text=user_text,
@@ -5491,7 +7082,7 @@ class AgentKernel:
                     critic_invocations=critic_invocations,
                     planner_bypass_count=planner_bypass_count,
                     task_classification=None
-                    if intent_bundle.task_classification is None
+                    if authoritative_contract_workflow or intent_bundle.task_classification is None
                     else intent_bundle.task_classification.model_dump(mode="json"),
                 )
                 observed_workflow_state = WorkflowState.model_validate(observation_summary.get("workflow_state") or {})
@@ -5507,6 +7098,27 @@ class AgentKernel:
                         "active_overall_goal": None
                         if active_overall_goal is None
                         else active_overall_goal.model_dump(mode="json"),
+                    },
+                )
+                self.trace_store.append(
+                    "state_machine_progress",
+                    {
+                        "trace_id": trace_id,
+                        "step": step,
+                        "phase": "after_tool_result",
+                        "executed_tool": result.tool_name,
+                        "tool_status": result.status,
+                        "produced_outputs": [
+                            output.value if isinstance(output, OutputKind) else str(output)
+                            for output in result.produced_outputs
+                        ],
+                        "workflow": self._build_contract_workflow_debug_payload(
+                            workflow_spec=getattr(intent_bundle.task_envelope, "workflow_spec", None),
+                            completed_outputs=completed_outputs,
+                            candidate_state=active_candidate_state,
+                            observed_workflow_state=observed_workflow_state,
+                            active_overall_goal=active_overall_goal,
+                        ),
                     },
                 )
                 if completion.done:
@@ -5543,9 +7155,9 @@ class AgentKernel:
                     loop_stop_reason = current_stop_reason
                     break
         except Exception as exc:  # noqa: BLE001
-            error_text = self.llm_client.build_unavailable_response(exc)
+            # 不走模板化回复。让上层的自诊断 + 正常回复逻辑处理
+            error_text = ""
             artifacts.final_response = error_text
-            self.history.append(Message(role=Role.ASSISTANT, content=error_text))
             self.trace_store.append("error", {"trace_id": trace_id, "error": str(exc)})
             self._emit_progress(
                 progress_callback,
@@ -5553,9 +7165,13 @@ class AgentKernel:
                 f"中途出了点问题：{exc}",
                 {"trace_id": trace_id, "error": str(exc)},
             )
+            self._append_llm_call_metrics_trace(trace_id, llm_metrics_start)
+            self._write_turn_trace_audit(trace_id)
             return artifacts
 
-        final_observations = ContextBuilder.build_observations(tool_results)
+        final_observations = [
+            obs[:300] for obs in ContextBuilder.build_observations(tool_results)[:8]
+        ]
         final_completion = self.completion_judge.assess(
             overall_task_goal=active_overall_goal,
             completed_outputs=completed_outputs,
@@ -5576,7 +7192,7 @@ class AgentKernel:
             planner_invocations=planner_invocations,
             critic_invocations=critic_invocations,
             planner_bypass_count=planner_bypass_count,
-            task_classification=intent_bundle.task_classification,
+            task_classification=None if authoritative_contract_workflow else intent_bundle.task_classification,
         )
         artifacts.execution_summary = execution_summary
         if (
@@ -5590,6 +7206,15 @@ class AgentKernel:
                 candidate_state=active_candidate_state,
                 overall_task_goal=active_overall_goal,
             )
+        # 自诊断：当任务异常终止时，尝试分析 trace 给出根因和修复建议
+        if loop_stop_reason and loop_stop_reason not in ("waiting_for_selection", "completion_judge"):
+            self._append_self_diagnosis(
+                execution_summary=execution_summary,
+                loop_stop_reason=loop_stop_reason,
+                trace_id=trace_id,
+                user_text=user_text,
+            )
+
         self._emit_progress(progress_callback, "responding", "结果已经整理好了，我现在把它翻译成人话。", {})
         speech_text = ""
         if artifacts.pending_task is not None:
@@ -5614,6 +7239,8 @@ class AgentKernel:
         else:
             try:
                 structured_bundle = self._build_structured_qq_history_response_bundle(execution_summary)
+                if structured_bundle is None:
+                    structured_bundle = self._build_structured_document_inspect_response_bundle(execution_summary)
                 if structured_bundle is None:
                     structured_bundle = self._build_structured_document_edit_response_bundle(execution_summary)
                 if structured_bundle is not None:
@@ -5664,7 +7291,7 @@ class AgentKernel:
                             execution_summary=execution_summary,
                         )
             except Exception as exc:  # noqa: BLE001
-                final_response = self.llm_client.build_unavailable_response(exc)
+                final_response = f"这一步出了点问题：{exc}。看看 trace 里的 self_diagnosis 能定位到根因。"
         grounding_review = self.execution_critic.review_grounding(
             user_text=user_text,
             execution_summary=execution_summary,
@@ -5694,6 +7321,8 @@ class AgentKernel:
         artifacts.speech_text = speech_text
         self.history.append(Message(role=Role.ASSISTANT, content=final_response))
         self.trace_store.append("final_response", {"trace_id": trace_id, "text": final_response})
+        self._append_llm_call_metrics_trace(trace_id, llm_metrics_start)
+        self._write_turn_trace_audit(trace_id)
         artifacts.debug_summary = (
             f"我一共跑了 {len(tool_results)} 个工具步骤，"
             f"目前拿到的输出有：{', '.join(item.value for item in artifacts.completed_outputs) or '无'}。"
@@ -5725,6 +7354,49 @@ class AgentKernel:
             },
         )
         return artifacts
+
+    def _append_llm_call_metrics_trace(self, trace_id: str, metrics_start: int) -> None:
+        metrics = list(getattr(self.llm_client, "last_call_metrics", []) or [])
+        if metrics_start < 0:
+            metrics_start = 0
+        turn_metrics = metrics[metrics_start:]
+        if not turn_metrics:
+            return
+        total_tokens = 0
+        total_elapsed_ms = 0.0
+        compact_calls: list[dict[str, Any]] = []
+        for item in turn_metrics:
+            if not isinstance(item, dict):
+                continue
+            usage = item.get("usage") if isinstance(item.get("usage"), dict) else {}
+            try:
+                total_tokens += int(usage.get("total_tokens") or 0)
+            except (TypeError, ValueError):
+                pass
+            try:
+                total_elapsed_ms += float(item.get("elapsed_ms") or 0.0)
+            except (TypeError, ValueError):
+                pass
+            compact_calls.append(
+                {
+                    "provider": item.get("provider"),
+                    "model": item.get("model"),
+                    "elapsed_ms": item.get("elapsed_ms"),
+                    "usage": usage,
+                }
+            )
+        if not compact_calls:
+            return
+        self.trace_store.append(
+            "llm_call_metrics",
+            {
+                "trace_id": trace_id,
+                "call_count": len(compact_calls),
+                "total_tokens": total_tokens,
+                "total_elapsed_ms": round(total_elapsed_ms, 2),
+                "calls": compact_calls,
+            },
+        )
 
     def _review_execution_state(
         self,
@@ -6090,10 +7762,21 @@ class AgentKernel:
         candidate_paths: list[str] = []
         written_files: list[str] = []
         web_sources: list[dict] = []
+        tool_evidence: list[dict] = []
 
         for result in tool_results:
             if result.status == "success":
-                successful_actions.append({"tool_name": result.tool_name, "data": result.data})
+                successful_actions.append(
+                    {
+                        "tool_name": result.tool_name,
+                        "data": result.data,
+                        "produced_outputs": [item.value for item in result.produced_outputs],
+                        "evidence": list(result.evidence),
+                    }
+                )
+                for item in result.evidence:
+                    if isinstance(item, dict) and item not in tool_evidence:
+                        tool_evidence.append(item)
                 if result.tool_name == "retrieval.search_local_objects":
                     for candidate in result.data.get("candidates", [])[:5]:
                         path = candidate.get("path")
@@ -6212,6 +7895,7 @@ class AgentKernel:
             "written_files": written_files,
             "requested_output_file": requested_output_file,
             "web_sources": web_sources,
+            "tool_evidence": tool_evidence,
             "successful_actions": successful_actions,
             "failed_actions": failed_actions,
         }
@@ -6555,6 +8239,10 @@ class AgentKernel:
         execution_summary: dict[str, Any],
     ) -> dict[str, str] | None:
         try:
+            response_hint = (
+                str(response_hint or "").strip()
+                + "\nAlways reply in natural Chinese. Do not switch to English for partial success, errors, or tool summaries."
+            ).strip()
             system_name = getattr(self.config, "system_name", "local-agent")
             persona_name = getattr(self.config, "persona_name", None)
             persona_profile = getattr(self.config, "persona_profile", None)
@@ -6597,6 +8285,7 @@ class AgentKernel:
             "The task is only partially complete.",
             "Explain clearly what has already been confirmed and what is still missing.",
             "Do not claim the task is finished.",
+            "Reply in natural Chinese, even if tool observations or errors are in English.",
         ]
         if candidate_paths:
             hints.append("Candidate paths are available. Mention the most relevant candidates and ask the user to choose one or narrow the scope.")
@@ -6796,6 +8485,69 @@ class AgentKernel:
         return None
 
     @classmethod
+    def _build_structured_document_inspect_response_bundle(cls, execution_summary: dict) -> dict[str, str] | None:
+        successful_actions = execution_summary.get("successful_actions") or []
+        if not isinstance(successful_actions, list):
+            return None
+
+        for action in reversed(successful_actions):
+            if not isinstance(action, dict):
+                continue
+            tool_name = str(action.get("tool_name", "") or "").strip()
+            if tool_name != "document_agent.inspect":
+                continue
+            data = action.get("data") if isinstance(action.get("data"), dict) else {}
+            answer = " ".join(str(data.get("answer", "") or "").split())
+            summary = " ".join(str(data.get("summary", "") or "").split())
+            speech = " ".join(str(data.get("speech_text", "") or "").split())
+            path = str(data.get("path", "") or "").strip()
+            if not answer and not summary and not speech:
+                continue
+
+            lines: list[str] = []
+            if answer:
+                lines.append(answer)
+            elif summary:
+                lines.append(summary)
+
+            if summary and summary != answer:
+                lines.append(f"依据：{summary}")
+
+            findings = data.get("findings") if isinstance(data.get("findings"), list) else []
+            evidence_items = data.get("evidence") if isinstance(data.get("evidence"), list) else []
+            detail_lines: list[str] = []
+            for item in findings[:2]:
+                if not isinstance(item, dict):
+                    continue
+                claim = " ".join(str(item.get("claim", "") or "").split())
+                evidence = " ".join(str(item.get("evidence", "") or "").split())
+                if claim and evidence:
+                    detail_lines.append(f"{claim}：{evidence}")
+                elif claim:
+                    detail_lines.append(claim)
+            if not detail_lines:
+                for item in evidence_items[:2]:
+                    if not isinstance(item, dict):
+                        continue
+                    excerpt = " ".join(str(item.get("excerpt", "") or "").split())
+                    reason = " ".join(str(item.get("reason", "") or "").split())
+                    if excerpt and reason:
+                        detail_lines.append(f"{reason}：{excerpt}")
+                    elif excerpt:
+                        detail_lines.append(excerpt)
+
+            if detail_lines:
+                lines.append("证据：" + "；".join(detail_lines))
+            if path:
+                lines.append(f"文件：{path}")
+
+            display = "\n".join(line for line in lines if line).strip()
+            speech_text = speech or answer or summary or display
+            return {"display_text": display, "speech_text": speech_text}
+
+        return None
+
+    @classmethod
     def _build_structured_qq_history_response_bundle(cls, execution_summary: dict) -> dict[str, str] | None:
         task_classification = execution_summary.get("task_classification") or {}
         task_kind = str(task_classification.get("task_kind", "") or "").strip().lower()
@@ -6941,262 +8693,6 @@ class AgentKernel:
     def _supports_message_delivery(self) -> bool:
         return self.registry.has_tool("qq.send_file")
 
-    def _build_shared_workflow_proposals(
-        self,
-        *,
-        user_text: str,
-        completed_outputs: list[OutputKind],
-        candidate_state: CandidateState | None,
-        overall_task_goal: TaskGoal | None,
-        task_classification,
-        knowledge_intent,
-        document_delivery_intent,
-        site_search_intent,
-        tool_results: list[ToolCallResult],
-        recent_context: str = "",
-        local_search_decision: ToolDecision | None = None,
-        allow_programmatic_lookup_workflow: bool = True,
-        local_search_source: str = "local_search_planner",
-        local_search_priority: int = 98,
-        local_search_reason: str = "LLM-planned initial local search workflow",
-        document_summary_priority: int = 90,
-        document_summary_reason: str = "Document summary workflow",
-        document_operation_priority: int = 92,
-        document_operation_reason: str = "Document operation workflow",
-        file_delivery_priority: int = 88,
-        file_delivery_reason: str = "File delivery workflow",
-        local_lookup_priority: int = 84,
-        local_lookup_reason: str = "Local lookup workflow",
-        web_target_priority: int = 86,
-        web_target_reason: str = "Web target workflow",
-        web_lookup_priority: int = 74,
-        web_lookup_reason: str = "General web lookup workflow",
-        include_scheduled_task_fire: bool = False,
-        scheduled_task_fire_priority: int = 97,
-        scheduled_task_fire_reason: str = "Deliver a fired scheduled QQ notification.",
-        runtime_channel: str | None = None,
-        runtime_channel_context: dict[str, Any] | None = None,
-        include_qq_history: bool = False,
-        qq_history_priority: int = 94,
-        qq_history_reason: str = "QQ history workflow",
-        include_system_utility: bool = False,
-        system_utility_priority: int = 93,
-        system_utility_reason: str = "System utility workflow",
-    ) -> list[WorkflowProposal]:
-        supports_message_delivery = self._supports_message_delivery()
-        proposals: list[WorkflowProposal] = [
-            WorkflowProposal(
-                source=local_search_source,
-                family=self._local_search_planner_family(task_classification),
-                priority=local_search_priority,
-                reason=local_search_reason,
-                decision=local_search_decision,
-            )
-        ]
-
-        if include_scheduled_task_fire:
-            proposals.append(
-                WorkflowProposal(
-                    source="scheduled_task_fire",
-                    family="delivery",
-                    priority=scheduled_task_fire_priority,
-                    reason=scheduled_task_fire_reason,
-                    decision=self._build_fired_scheduled_task_delivery_workflow(
-                        runtime_channel=runtime_channel,
-                        runtime_channel_context=runtime_channel_context,
-                    ),
-                )
-            )
-
-        if include_qq_history:
-            proposals.append(
-                WorkflowProposal(
-                    source="qq_history",
-                    family="qq_history",
-                    priority=qq_history_priority,
-                    reason=qq_history_reason,
-                    decision=self._build_qq_history_workflow(
-                        user_text=user_text,
-                        overall_task_goal=overall_task_goal,
-                        task_classification=task_classification,
-                        recent_context=recent_context,
-                    ),
-                )
-            )
-
-        proposals.extend(
-            [
-                WorkflowProposal(
-                    source="document_summary",
-                    family="document_summary",
-                    priority=document_summary_priority,
-                    reason=document_summary_reason,
-                    decision=None if not allow_programmatic_lookup_workflow else self._build_document_summary_workflow(
-                        user_text=user_text,
-                        completed_outputs=completed_outputs,
-                        candidate_state=candidate_state,
-                        overall_task_goal=overall_task_goal,
-                        knowledge_intent=knowledge_intent,
-                        task_classification=task_classification,
-                        supports_message_delivery=supports_message_delivery,
-                    ),
-                ),
-                WorkflowProposal(
-                    source="document_operation",
-                    family="document_operation",
-                    priority=document_operation_priority,
-                    reason=document_operation_reason,
-                    decision=None if not allow_programmatic_lookup_workflow else self._build_document_operation_workflow(
-                        user_text=user_text,
-                        completed_outputs=completed_outputs,
-                        candidate_state=candidate_state,
-                        overall_task_goal=overall_task_goal,
-                        knowledge_intent=knowledge_intent,
-                        task_classification=task_classification,
-                        supports_message_delivery=supports_message_delivery,
-                    ),
-                ),
-                WorkflowProposal(
-                    source="file_delivery",
-                    family="file_delivery",
-                    priority=file_delivery_priority,
-                    reason=file_delivery_reason,
-                    decision=None if not allow_programmatic_lookup_workflow else self._build_file_delivery_workflow(
-                        user_text=user_text,
-                        completed_outputs=completed_outputs,
-                        candidate_state=candidate_state,
-                        overall_task_goal=overall_task_goal,
-                        knowledge_intent=knowledge_intent,
-                        task_classification=task_classification,
-                        supports_message_delivery=supports_message_delivery,
-                    ),
-                ),
-                WorkflowProposal(
-                    source="local_lookup",
-                    family="local_lookup",
-                    priority=local_lookup_priority,
-                    reason=local_lookup_reason,
-                    decision=None if not allow_programmatic_lookup_workflow else self._build_local_file_lookup_workflow(
-                        user_text=user_text,
-                        completed_outputs=completed_outputs,
-                        candidate_state=candidate_state,
-                        knowledge_intent=knowledge_intent,
-                        overall_task_goal=overall_task_goal,
-                        task_classification=task_classification,
-                    ),
-                ),
-                WorkflowProposal(
-                    source="web_target",
-                    family="web_target",
-                    priority=web_target_priority,
-                    reason=web_target_reason,
-                    decision=self._build_web_target_workflow(
-                        user_text=user_text,
-                        completed_outputs=completed_outputs,
-                        tool_results=tool_results,
-                    ),
-                ),
-                WorkflowProposal(
-                    source="web_lookup",
-                    family="web_lookup",
-                    priority=web_lookup_priority,
-                    reason=web_lookup_reason,
-                    decision=self.web_retrieval_strategy.build_initial_lookup(
-                        user_text=user_text,
-                        completed_outputs=completed_outputs,
-                        delivery_intent=document_delivery_intent,
-                        knowledge_intent=knowledge_intent,
-                        site_search_intent=site_search_intent,
-                    ),
-                ),
-            ]
-        )
-
-        if include_system_utility:
-            proposals.append(
-                WorkflowProposal(
-                    source="system_utility",
-                    family="system_utility",
-                    priority=system_utility_priority,
-                    reason=system_utility_reason,
-                    decision=self._build_system_utility_workflow(
-                        user_text=user_text,
-                        completed_outputs=completed_outputs,
-                        overall_task_goal=overall_task_goal,
-                        task_classification=task_classification,
-                        recent_context=recent_context,
-                    ),
-                )
-            )
-
-        return proposals
-
-    def _bind_workflow_plan(
-            self,
-            *,
-            user_text: str,
-            intent_bundle,
-            overall_task_goal: TaskGoal | None,
-            candidate_state: CandidateState | None,
-            completed_outputs: list[OutputKind],
-            tool_results: list[ToolCallResult],
-            recent_context: str = "",
-            runtime_channel: str | None = None,
-            runtime_channel_context: dict[str, Any] | None = None,
-    ) -> dict[str, object]:
-        proposals = self._build_shared_workflow_proposals(
-            user_text=user_text,
-            completed_outputs=completed_outputs,
-            candidate_state=candidate_state,
-            overall_task_goal=overall_task_goal,
-            task_classification=intent_bundle.task_classification,
-            knowledge_intent=intent_bundle.knowledge_request,
-            document_delivery_intent=intent_bundle.document_delivery,
-            site_search_intent=intent_bundle.site_search,
-            tool_results=tool_results,
-            recent_context=recent_context,
-            local_search_decision=self._build_llm_local_search_workflow(
-                user_text=user_text,
-                completed_outputs=completed_outputs,
-                candidate_state=candidate_state,
-                overall_task_goal=overall_task_goal,
-                knowledge_intent=intent_bundle.knowledge_request,
-                task_classification=intent_bundle.task_classification,
-                supports_message_delivery=self._supports_message_delivery(),
-            ),
-            include_scheduled_task_fire=True,
-            runtime_channel=runtime_channel,
-            runtime_channel_context=runtime_channel_context,
-            include_qq_history=True,
-            include_system_utility=True,
-        )
-
-        chosen = WorkflowSelector.choose(
-            proposals=proposals,
-            intent_bundle=intent_bundle,
-            completed_outputs=completed_outputs,
-            candidate_state=candidate_state,
-        )
-
-        if chosen is None:
-            return {
-                "workflow_family": "generic",
-                "workflow_decision": None,
-                "overall_task_goal": overall_task_goal,
-            }
-
-        chosen_family = "generic"
-        for proposal in proposals:
-            if proposal.decision is chosen:
-                chosen_family = proposal.family
-                break
-
-        return {
-            "workflow_family": chosen_family,
-            "workflow_decision": chosen,
-            "overall_task_goal": chosen.overall_task_goal or overall_task_goal,
-        }
-
     @staticmethod
     def _should_force_grounded_partial(execution_summary: dict) -> bool:
         if execution_summary.get("task_status") == "completed":
@@ -7284,7 +8780,7 @@ class AgentKernel:
             channel_runtime = None
 
         if task_type == "notify":
-            text = str(task.get("message") or task_payload.get("text") or "").strip()
+            text = str(task_payload.get("fire_text") or task.get("message") or task_payload.get("text") or "").strip()
             if not text:
                 return None
             scheduled_runtime_context = dict(channel_runtime or {})
@@ -7294,11 +8790,68 @@ class AgentKernel:
                 "reminder_id": str(task.get("reminder_id") or "").strip() or None,
                 "message": text,
             }
-            return self.handle_user_input(
-                f"把这句话发到当前QQ会话：{text}",
-                runtime_session_id=session_id,
-                runtime_channel=channel,
-                runtime_channel_context=scheduled_runtime_context,
+            trace_id = f"trace_{uuid.uuid4().hex[:12]}"
+            access_policy = (
+                scheduled_runtime_context.get("access_policy")
+                if isinstance(scheduled_runtime_context.get("access_policy"), dict)
+                else None
+            )
+            request = ToolRegistry.build_request(
+                trace_id=trace_id,
+                session_id=session_id or "",
+                tool_name="qq.send_text",
+                arguments={"message": text, "target_kind": "current"},
+                execution_context={
+                    "execution_brief": "Fire cached reminder notification directly without re-planning.",
+                    "required_outputs": [OutputKind.MESSAGE_SENT.value],
+                    "grounded_inputs": {
+                        "scheduled_reminder_id": str(task.get("reminder_id") or "").strip(),
+                        "cached_fire_text": text,
+                        "original_message": str(task.get("message") or "").strip(),
+                    },
+                },
+            )
+            tool_use_context = ToolUseContext.from_execution_context(
+                trace_id=trace_id,
+                session_id=session_id or "",
+                workspace_root=self.config.workspace_root,
+                execution_context=request.execution_context,
+                channel=channel,
+                access_policy=access_policy,
+                runtime_settings=scheduled_runtime_context,
+                metadata={
+                    "scheduled_task": True,
+                    "reminder_id": str(task.get("reminder_id") or "").strip() or None,
+                    "dispatch_mode": "cached_direct_fire",
+                },
+            )
+            if getattr(self, "trace_store", None) is not None:
+                self.trace_store.append(
+                    "scheduled_task_cached_fire",
+                    {
+                        "trace_id": trace_id,
+                        "session_id": session_id,
+                        "reminder_id": str(task.get("reminder_id") or "").strip() or None,
+                        "message": text,
+                    },
+                )
+            result = self.registry.execute(request, context=tool_use_context)
+            if getattr(self, "trace_store", None) is not None:
+                self.trace_store.append(
+                    "scheduled_task_cached_fire_result",
+                    {
+                        "trace_id": trace_id,
+                        "session_id": session_id,
+                        "reminder_id": str(task.get("reminder_id") or "").strip() or None,
+                        "result": result.model_dump(mode="json"),
+                    },
+                )
+            return TurnArtifacts(
+                tool_results=[result],
+                final_response=text,
+                speech_text=text,
+                completed_outputs=[OutputKind.MESSAGE_SENT] if result.status == "success" else [],
+                trace_id=trace_id,
             )
 
         if task_type == "deferred_agent_task":

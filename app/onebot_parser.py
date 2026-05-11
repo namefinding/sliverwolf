@@ -389,8 +389,12 @@ def message_mentions_self(payload: dict[str, Any]) -> bool:
                 return True
 
     raw_message = payload.get("raw_message")
-    if isinstance(raw_message, str) and f"[CQ:at,qq={normalized_self_id}]" in raw_message:
-        return True
+    if isinstance(raw_message, str):
+        if f"[CQ:at,qq={normalized_self_id}]" in raw_message:
+            return True
+        # NapCat may encode @ as "QQ####" or just include the number
+        if str(normalized_self_id) in raw_message and "@" in raw_message:
+            return True
     return False
 
 
@@ -405,21 +409,56 @@ def is_self_message(payload: dict[str, Any]) -> bool:
     return str(self_id).strip() == str(sender_id).strip()
 
 
-def should_respond(payload: dict[str, Any]) -> bool:
+# 群聊主动插话计数器：每个群每收到 N 条未 @ 的消息，放一条让 agent 自行决定是否回复
+def message_mentions_assistant_name(payload: dict[str, Any], assistant_aliases: tuple[str, ...] | list[str] | set[str] = ()) -> bool:
+    text = extract_text(payload)
+    normalized_text = _normalize_address_text(text)
+    if not normalized_text:
+        return False
+    for alias in assistant_aliases:
+        normalized_alias = _normalize_address_text(str(alias or ""))
+        if not normalized_alias:
+            continue
+        # 消息中包含银狼名字 → 提到它
+        if normalized_alias in normalized_text:
+            return True
+    return False
+
+
+def _normalize_address_text(value: str) -> str:
+    return re.sub(
+        r"[\s`'\"\u201c\u201d\u2018\u2019\u300c\u300d\uff0c\u3002\uff01\uff1f?.!?:\uff1a\uff1b\uff08\uff09()\[\]{}_-]+",
+        "",
+        str(value or "").strip().lower(),
+    )
+
+
+def should_respond(
+    payload: dict[str, Any],
+    *,
+    assistant_aliases: tuple[str, ...] | list[str] | set[str] = (),
+) -> bool:
     message_type = str(payload.get("message_type", "")).strip()
     if message_type == "private":
         return True
     if message_type == "group":
-        return message_mentions_self(payload)
+        # 群聊：只有 @ 银狼 才触发指定回复
+        if message_mentions_self(payload):
+            return True
+        return False
     return False
 
 
-def extract_onebot_message(payload: dict[str, Any]) -> OneBotInboundMessage | None:
+def extract_onebot_message(
+    payload: dict[str, Any],
+    *,
+    assistant_aliases: tuple[str, ...] | list[str] | set[str] = (),
+) -> OneBotInboundMessage | None:
     if not is_onebot_event(payload):
         return None
     if is_self_message(payload):
         return None
-    if not should_respond(payload):
+    if not should_respond(payload, assistant_aliases=assistant_aliases):
         return None
 
     message_type = str(payload.get("message_type", "")).strip()
@@ -443,6 +482,16 @@ def extract_onebot_message(payload: dict[str, Any]) -> OneBotInboundMessage | No
         session_id = f"onebot_private_{sender_id}"
         target = OneBotTarget(message_type="private", user_id=int(sender_id))
 
+    mentioned_self = message_mentions_self(payload)
+    mentioned_assistant_name = message_mentions_assistant_name(payload, assistant_aliases)
+    metadata = {
+        "raw_payload": payload,
+        "platform": "onebot_v11",
+        "addressed_to_assistant": bool(mentioned_self or mentioned_assistant_name),
+        "mentioned_self": bool(mentioned_self),
+        "mentioned_assistant_name": bool(mentioned_assistant_name),
+    }
+
     return OneBotInboundMessage(
         session_id=session_id,
         text=text,
@@ -450,7 +499,7 @@ def extract_onebot_message(payload: dict[str, Any]) -> OneBotInboundMessage | No
         mode=extract_mode(payload),
         scope_root=extract_scope_root(payload),
         target=target,
-        metadata={"raw_payload": payload, "platform": "onebot_v11"},
+        metadata=metadata,
         audio_attachments=audio_attachments,
         image_attachments=image_attachments,
     )

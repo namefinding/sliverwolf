@@ -42,7 +42,7 @@ def run_startup_healthcheck(
         _check_workspace(workspace),
         _check_db_parent("memory_store", memory_db),
         _check_db_parent("retrieval_store", retrieval_db),
-        _check_ollama(config.agent.ollama_base_url, ollama_probe),
+        _check_llm_provider(config, ollama_probe),
         _check_voice(config.voice.enabled, config.voice.endpoint, voice_probe),
     ]
 
@@ -73,6 +73,22 @@ def _check_db_parent(name: str, db_path: Path) -> HealthCheckResult:
 def _check_ollama(base_url: str, probe: Callable[[str], tuple[bool, str]]) -> HealthCheckResult:
     ok, message = probe(base_url)
     return HealthCheckResult("ollama", "ok" if ok else "error", message, critical=False)
+
+
+def _check_llm_provider(config: AppConfig, ollama_probe: Callable[[str], tuple[bool, str]]) -> HealthCheckResult:
+    provider = str(getattr(config.agent, "llm_provider", "") or "ollama").strip().lower()
+    if provider in {"deepseek", "openai_compatible"}:
+        key_env = str(getattr(config.agent, "api_key_env", "") or "DEEPSEEK_API_KEY").strip()
+        base_url = str(getattr(config.agent, "api_base_url", "") or "").strip()
+        if not key_env:
+            return HealthCheckResult("llm_provider", "warning", "API key env var is not configured", critical=False)
+        return HealthCheckResult(
+            "llm_provider",
+            "ok",
+            f"Using {provider} at {base_url or 'default API base'}; API key is read from {key_env}",
+            critical=False,
+        )
+    return _check_ollama(config.agent.ollama_base_url, ollama_probe)
 
 
 def _check_voice(enabled: bool, endpoint: str, probe: Callable[[str], tuple[bool, str]]) -> HealthCheckResult:

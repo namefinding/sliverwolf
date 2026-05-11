@@ -37,6 +37,23 @@ def build_file_action(target: OneBotTarget, file_path: str) -> dict[str, Any]:
     }
 
 
+def build_image_action(target: OneBotTarget, image_path: str) -> dict[str, Any]:
+    """构造发送图片的 OneBot action。"""
+    image_file = str(Path(image_path).resolve()).replace("\\", "/")
+    message = [{"type": "image", "data": {"file": image_file}}]
+    if target.message_type == "group":
+        return {
+            "action": "send_group_msg",
+            "params": {"group_id": target.group_id, "message": message},
+            "echo": f"image_{uuid4().hex[:12]}",
+        }
+    return {
+        "action": "send_private_msg",
+        "params": {"user_id": target.user_id, "message": message},
+        "echo": f"image_{uuid4().hex[:12]}",
+    }
+
+
 def build_voice_action(target: OneBotTarget, audio_path: str) -> dict[str, Any]:
     audio_file = str(Path(audio_path).resolve()).replace("\\", "/")
     message = [{"type": "record", "data": {"file": audio_file}}]
